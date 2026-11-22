@@ -14,11 +14,13 @@ Cool machine, all-4-bit weights (see below), `llama-bench`, tokens/s:
 |---|---:|---:|---:|
 | LM Studio, Q4_K_M (for reference) | ~105 | — | ~21.6 |
 | This patch, previous version | 334 | 296 | 27.4 |
-| **This patch, prefill kernels** | **460** (best ~500) | **433** | **28.6** |
+| This patch, prefill kernels | 460 (best ~500) | 433 | 28.6 |
+| **+ decode fusions and f16 controllers** | **460** | **433** | **33.7** |
 
-- Prefill is **~4.4× LM Studio**, and decode is ~1.3× LM Studio.
+- Prefill is **~4.4× LM Studio**, and decode is **~1.6× LM Studio**.
+- Decode figures come from short `tg32` runs on a cool Air. With the fusions, GPU time per token drops from ~31.5 to ~29.5 ms (5,440 graph nodes instead of 6,880).
 - The Air throttles hard under sustained load. Back-to-back runs drop to roughly 240–320 prefill and 16–20 decode. The relative gains held at that temperature too.
-- The decode-fusion gains below were measured on the M3 Ultra. An Air run is pending (see "Status").
+- The decode fusions gain **+7% on the Air** and **+25% on the M3 Ultra**. The Air's slower memory makes kernel overhead a smaller share of each token.
 
 ### Mac Studio (M3 Ultra)
 
@@ -117,7 +119,6 @@ The Q4_K_M recipe keeps the expert down-projections at Q8_0/Q5_0 and the output 
 
 ## Status
 
-- The decode fusions haven't been benchmarked on the Air yet. It was under heavy background load, so the run is pending. The Studio numbers above are measured.
 - The patch targets one pinned llama.cpp revision and has not been sent upstream.
 
 ## Method notes
