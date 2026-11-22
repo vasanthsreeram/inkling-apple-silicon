@@ -124,6 +124,7 @@ The Q4_K_M recipe keeps the expert down-projections at Q8_0/Q5_0 and the output 
 | `INKLING_DEPTH_MIX`, `INKLING_REL_BIAS` | Fused depth attention; relative bias folded into the attention mask | prefill |
 | `INKLING_MOE64=32`, `INKLING_MOE64_WS=1` | M5: 64-token expert tiles, 4 SIMD groups dequantise while 4 run the matmul | prefill |
 | `INKLING_CTRL_FUSE`, `INKLING_CONV_STATE` | Decode fusions described above | decode |
+| `INKLING_ORDER` | Emits independent kernels (q/k/v controllers, norms, projections) next to each other so they share barriers; bit-identical output, +5% decode on M3 Ultra | both |
 | `INKLING_METAL_TIMING` | Print nodes, encode time and GPU time per graph | diagnostics |
 | Others in the patch (`W4A8`, `NAX_TILE`, `ROUTE_MAP`, `PAIRED_GATES`, …) | Experiments kept for reproducibility; no gain measured | — |
 
