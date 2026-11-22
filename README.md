@@ -32,6 +32,26 @@ Cool machine, all-4-bit weights (see below), `llama-bench`, tokens/s:
 
 Through `llama-server` (six 128-token greedy requests), decode went from **45.8 to 56.7 tok/s**.
 
+### Against LM Studio and nanoattention
+
+Same machine, back to back, fresh 2K prompts and 128-token decodes ([details and caveats](results/2026-11-23-vs-lmstudio-nanoattention.md)):
+
+| Mac Studio M3 Ultra | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| LM Studio (Q4_K_M) | 549 | 28.6 |
+| [nanoattention](https://github.com/justrach/nanoattention) (original checkpoint, best batch) | 870 | 31.2 |
+| **This patch (same Q4_K_M)** | **1,111** | **54.5** |
+| **This patch (all-4-bit)** | **1,135** | **58.5** |
+
+| MacBook Air M5, warm, same round | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| LM Studio (Q4_K_M) | 81 | 16.2 |
+| nanoattention (original checkpoint, batch 128) | 101 | 8.4 |
+| **This patch (same Q4_K_M)** | **256** | **25.2** |
+| **This patch (all-4-bit)** | **338** | **31.9** |
+
+nanoattention runs the original NVFP4/MXFP8 weights, which are higher fidelity than any 4-bit GGUF. On the 32 GB Air that 19.5 GB checkpoint doesn't stay resident and pages from SSD.
+
 ### Where decode time goes
 
 A decode token has to read about **3.0 GB of weights**: 1.72 GB of experts (8 of 128 per pass) plus 1.28 GB of everything else. `bench/decode_bench.cpp` runs only those weight-reading matmuls, in model order, at the real types and shapes:
