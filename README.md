@@ -18,7 +18,7 @@ Cool machine, all-4-bit weights (see below), `llama-bench`, tokens/s:
 | **+ decode fusions and f16 controllers** | **460** | **433** | **33.7** |
 
 - Prefill is **~4.4× LM Studio**, and decode is **~1.6× LM Studio**.
-- Decode figures come from short `tg32` runs on a cool Air. With the fusions, GPU time per token drops from ~31.5 to ~29.5 ms (5,440 graph nodes instead of 6,880).
+- The 33.7 decode is from short `tg32` runs on a cool Air; the rows above it used `tg128`. Measured the same way just before, the previous build gave 31.6, so the like-for-like gain is **31.6 → 33.7**. GPU time per token drops from ~31.5 to ~29.5 ms (5,440 graph nodes instead of 6,880).
 - The Air throttles hard under sustained load. Back-to-back runs drop to roughly 240–320 prefill and 16–20 decode. The relative gains held at that temperature too.
 - The decode fusions gain **+7% on the Air** and **+25% on the M3 Ultra**. The Air's slower memory makes kernel overhead a smaller share of each token.
 
