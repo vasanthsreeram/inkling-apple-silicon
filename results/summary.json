@@ -1,0 +1,118 @@
+{
+  "engines": [
+    {
+      "machine": "MacBook Air M5, 32 GB",
+      "note": "llama-server, fresh 2K prompts, six 128-token decodes, on AC, 24 Nov. nanoattention from a separate run on 23 Nov (battery), where LM Studio scored 165 / 24.0.",
+      "rows": [
+        {
+          "name": "LM Studio, Q4_K_M",
+          "ours": false,
+          "prefill": 161,
+          "decode": 22.8
+        },
+        {
+          "name": "nanoattention, 4-bit",
+          "ours": false,
+          "prefill": 181,
+          "decode": 19.8,
+          "other_session": true
+        },
+        {
+          "name": "This patch, same Q4_K_M",
+          "ours": true,
+          "prefill": 376,
+          "decode": 29.8
+        },
+        {
+          "name": "This patch, tie64 + int8",
+          "ours": true,
+          "prefill": 462,
+          "decode": 32.0
+        }
+      ]
+    },
+    {
+      "machine": "Mac Studio M3 Ultra",
+      "note": "llama-server, fresh 2K prompts, 128-token decodes, back to back, 23 Nov.",
+      "rows": [
+        {
+          "name": "LM Studio, Q4_K_M",
+          "ours": false,
+          "prefill": 549,
+          "decode": 28.6
+        },
+        {
+          "name": "nanoattention, original weights",
+          "ours": false,
+          "prefill": 870,
+          "decode": 31.2
+        },
+        {
+          "name": "This patch, same Q4_K_M",
+          "ours": true,
+          "prefill": 1111,
+          "decode": 54.5
+        },
+        {
+          "name": "This patch, all-4-bit",
+          "ours": true,
+          "prefill": 1135,
+          "decode": 58.5
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "machine": "MacBook Air M5",
+      "prefill_label": "Prefill, 2K tokens",
+      "note": "llama-bench. 33.7 decode is a short tg32 run on a cool Air; the other decode values are tg128. The int8 step was measured on AC in a later session, alternating with the build before it (492 prefill, 29.8 decode in that session).",
+      "rows": [
+        {
+          "name": "Previous version",
+          "prefill": 296,
+          "decode": 27.4
+        },
+        {
+          "name": "+ prefill kernels",
+          "prefill": 433,
+          "decode": 28.6
+        },
+        {
+          "name": "+ decode fusions, f16 controllers",
+          "prefill": 433,
+          "decode": 33.7
+        },
+        {
+          "name": "+ int8 prefill, split encoding",
+          "prefill": 667,
+          "decode": 32.7,
+          "gain_prefill": "+36%",
+          "gain_decode": "+10%"
+        }
+      ]
+    },
+    {
+      "machine": "Mac Studio M3 Ultra",
+      "prefill_label": "Prefill, 1K tokens",
+      "note": "llama-bench, all-4-bit weights. int8 prefill needs the M5's neural accelerators.",
+      "rows": [
+        {
+          "name": "Previous version",
+          "prefill": 1005,
+          "decode": 38.5
+        },
+        {
+          "name": "+ prefill kernels",
+          "prefill": 1304,
+          "decode": 45.7
+        },
+        {
+          "name": "+ decode fusions",
+          "prefill": 1304,
+          "decode": 57.0
+        }
+      ]
+    }
+  ]
+}

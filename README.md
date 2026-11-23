@@ -6,6 +6,10 @@ Inkling isn't a typical MoE. Its middle 12 layers run **three times per token** 
 
 ## Results
 
+![Inkling 2 Mini speed: this patch against LM Studio and nanoattention, and the gain from each step, on the M5 Air and the M3 Ultra](results/comparison.svg)
+
+An interactive version is in `results/comparison.html`; the numbers are in `results/summary.json`, and `scripts/make_charts.py` regenerates both.
+
 ### MacBook Air (M5, 32 GB, fanless)
 
 Cool machine, all-4-bit weights (see below), `llama-bench`, tokens/s:
