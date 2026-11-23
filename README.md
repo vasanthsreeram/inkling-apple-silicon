@@ -15,9 +15,11 @@ Cool machine, all-4-bit weights (see below), `llama-bench`, tokens/s:
 | LM Studio, Q4_K_M (for reference) | ~105 | — | ~21.6 |
 | This patch, previous version | 334 | 296 | 27.4 |
 | This patch, prefill kernels | 460 (best ~500) | 433 | 28.6 |
-| **+ decode fusions and f16 controllers** | **460** | **433** | **33.7** |
+| + decode fusions and f16 controllers | 460 | 433 | 33.7 |
+| **+ int8 prefill, 64-wide scales, split encoding** | — | **667** | **32.7** |
 
 - Prefill is **~4.4× LM Studio**, and decode is **~1.6× LM Studio**.
+- The last row was measured later on AC power, alternating arms in the same session: with the new flags off the same build gave 492 prefill and 30.7 decode, so the like-for-like gains are **+36% prefill** and **+9–10% decode** ([details](results/2026-11-23-int8-prefill.md)). It uses the `tie64` weights described below.
 - The 33.7 decode is from short `tg32` runs on a cool Air; the rows above it used `tg128`. Measured the same way just before, the previous build gave 31.6, so the like-for-like gain is **31.6 → 33.7**. GPU time per token drops from ~31.5 to ~29.5 ms (5,440 graph nodes instead of 6,880).
 - The Air throttles hard under sustained load. Back-to-back runs drop to roughly 240–320 prefill and 16–20 decode. The relative gains held at that temperature too.
 - The decode fusions gain **+7% on the Air** and **+25% on the M3 Ultra**. The Air's slower memory makes kernel overhead a smaller share of each token.
@@ -49,6 +51,8 @@ Same machine, back to back, fresh 2K prompts and 128-token decodes ([details and
 | nanoattention (original checkpoint, batch 128) | 101 | 8.4 |
 | **This patch (same Q4_K_M)** | **256** | **25.2** |
 | **This patch (all-4-bit)** | **338** | **31.9** |
+
+Later, through `llama-server` on AC power (same Air, back to back): LM Studio **161 / 22.8**, this patch on the same Q4_K_M **376 / 29.8**, this patch on `tie64` with int8 prefill **462 / 32.0** ([details](results/2026-11-23-int8-prefill.md)).
 
 nanoattention runs the original NVFP4/MXFP8 weights, which are higher fidelity than any 4-bit GGUF. On the 32 GB Air that 19.5 GB checkpoint doesn't stay resident and pages from SSD.
 
@@ -84,9 +88,24 @@ Every change was compared against the unpatched path on the same weights:
 
 The disagreements come from floating-point summation order flipping near-ties. None of the changes approximate the model, apart from the optional all-4-bit file.
 
+### int8 prefill on the M5 (W4A8)
+
+The M5's neural accelerators run int8 matmuls faster than f16, so on M5 prefill quantises activations to int8 and multiplies them against the 4-bit weights directly. Q4_K rescales every 32 values, and that rescale reads the accumulator; on its own it limits int8 to about +6% in a standalone matmul benchmark. Rescaling every 64 values gives +37%.
+
+- `INKLING_W4A8` works on any 4-bit file, scale every 32 values: **+11% prefill**, 99.0% next-token agreement.
+- `scripts/tie64.py` rewrites a 4-bit file so each pair of 32-value blocks shares one scale. Types and layout stay the same, so every other kernel still reads it. With `INKLING_W4A8_G64`, 64-token tiles (`T64`) and small-expert tiles (`ADAPT`): **+36% prefill** together with `CONV_FUSE`. It costs 97.3% agreement and +1.4% perplexity; that cost comes from the rewritten file, not the int8 maths.
+- Splitting graph encoding over two CPU threads (`INKLING_METAL_ENCODERS=2`) hides the ~7 ms the CPU spends encoding each decode token: **+9% decode** on the Air.
+
+```sh
+GGUF_PY=build/source/gguf-py python3 scripts/tie64.py weights/Inkling-2-Mini-pure-Q4-ctrl16.gguf weights/Inkling-2-Mini-pure-Q4-tie64.gguf
+./serve.sh weights/Inkling-2-Mini-pure-Q4-tie64.gguf
+```
+
+`env.sh` enables the 64-wide path only when `INKLING_MODEL` names a `tie64` file (`serve.sh` sets it). On an untied file it must stay off.
+
 ## What didn't work
 
-- **int8 activations × int4 weights (W4A8) on the M5's neural accelerators** (`INKLING_W4A8`, off by default): correct, but not faster. Q4_K stores a scale every 32 values, so the integer units stall on every block. Dense layers came out slower (3.8 vs 5.4 TFLOP/s).
+- **Double-buffered weight loading in the int8 kernels** (`INKLING_W4A8_PIPE`): 17% slower; the extra threadgroup memory cuts how many work-groups fit per GPU core.
 - **Speculative decoding** with the model's own DSpark drafter: slower on the Air. Verifying k drafted tokens reads almost k times the expert weights, because 128 experts barely overlap, and only 45–59% of drafts are accepted.
 - **MLX (oMLX runtime)**: 80–105 prefill and 3–8 decode on the same Air. The Air was swapping during that run, so treat it as a floor, not a fair comparison.
 - **Core ML / ANE** for the controllers and draft projections: the planner placed single-token work on the CPU.
@@ -105,7 +124,7 @@ Benchmark:
 bin/llama-bench -m MODEL.gguf -fa 1 -ub 1024 -p 1024,2048 -n 128
 ```
 
-`env.sh` turns on the recommended flags, and adds the M5-only expert-tile kernel when it detects an M5. With no flags set, the binary behaves like upstream llama.cpp.
+`env.sh` turns on the recommended flags, and on an M5 adds the expert-tile kernel, int8 prefill and split encoding. With no flags set, the binary behaves like upstream llama.cpp.
 
 ### All-4-bit weights (optional, ~10–14% faster decode)
 
@@ -124,9 +143,14 @@ The Q4_K_M recipe keeps the expert down-projections at Q8_0/Q5_0 and the output 
 | `INKLING_DEPTH_MIX`, `INKLING_REL_BIAS` | Fused depth attention; relative bias folded into the attention mask | prefill |
 | `INKLING_MOE64=32`, `INKLING_MOE64_WS=1` | M5: 64-token expert tiles, 4 SIMD groups dequantise while 4 run the matmul | prefill |
 | `INKLING_CTRL_FUSE`, `INKLING_CONV_STATE` | Decode fusions described above | decode |
+| `INKLING_W4A8` | M5: int8 activations × 4-bit weights on the neural accelerators, scale every 32 values | prefill |
+| `INKLING_W4A8_G64`, `INKLING_W4A8_T64`, `INKLING_W4A8_ADAPT` | M5, `tie64` files only: scale every 64 values, 64-token tiles, 32-token tiles for experts with ≤32 tokens | prefill |
+| `INKLING_CONV_FUSE` | Prefill short convolution reads its saved state and input directly; bit-identical | prefill |
+| `INKLING_METAL_ENCODERS=2` | Encode each graph on two CPU threads so encoding overlaps GPU work | decode |
+| `INKLING_OP_PROFILE=2` | Time every kernel group in prefill-sized graphs and print a ranked table | diagnostics |
 | `INKLING_ORDER` | Emits independent kernels (q/k/v controllers, norms, projections) next to each other so they share barriers; bit-identical output, +5% decode on M3 Ultra | both |
 | `INKLING_METAL_TIMING` | Print nodes, encode time and GPU time per graph | diagnostics |
-| Others in the patch (`W4A8`, `NAX_TILE`, `ROUTE_MAP`, `PAIRED_GATES`, …) | Experiments kept for reproducibility; no gain measured | — |
+| Others in the patch (`W4A8_PIPE`, `NAX_TILE`, `ROUTE_MAP`, `PAIRED_GATES`, …) | Experiments kept for reproducibility; no gain measured | — |
 
 ## Repository
 
@@ -136,6 +160,7 @@ The Q4_K_M recipe keeps the expert down-projections at Q8_0/Q5_0 and the output 
 - `bench/corpus/gsm8k-sample.txt`: scoring corpus, a sample from [GSM8K](https://github.com/openai/grade-school-math) (MIT)
 - `scripts/model_bytes.py`: bytes read per decode token from a GGUF header
 - `scripts/make-pure-q4.sh`, `scripts/ctrl_f16.py`: the all-4-bit and f16-controller conversions
+- `scripts/tie64.py`: shares one scale per 64 values for the M5 int8 prefill path
 - `results/`: raw numbers behind the tables
 
 ## Status

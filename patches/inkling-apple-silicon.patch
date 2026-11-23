@@ -1,11 +1,9 @@
---- a/ggml/include/ggml.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/include/ggml.h	2026-11-22 17:38:01.000000000 +0800
-@@ -2283,6 +2283,14 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2283,6 +2283,12 @@
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
  
-+    // Inkling relative attention: add bias[q, h, min(qpos[q] - kpos[k], E)] to each score inside the kernel.
-+    // table: F32 [E + 1, n_head, n_q] contiguous, qpos: I32 [n_q], kpos: I32 [n_kv]. The mask stays the shared causal mask.
 +    GGML_API void ggml_flash_attn_ext_set_relative(
 +            struct ggml_tensor * a,
 +            struct ggml_tensor * table,
@@ -15,8 +13,8 @@
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
              struct ggml_context * ctx,
---- a/ggml/src/ggml.c	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml.c	2026-11-22 17:38:01.000000000 +0800
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
 @@ -5526,6 +5526,21 @@
      a->src[4] = sinks;
  }
@@ -39,9 +37,14 @@
  // ggml_flash_attn_back
  
  struct ggml_tensor * ggml_flash_attn_back(
---- a/ggml/src/ggml-metal/ggml-metal-common.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-common.cpp	2026-11-22 19:03:01.000000000 +0800
-@@ -5,6 +5,7 @@
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -1,3 +1,4 @@
++#include <cstring>
+ #include "ggml-metal-common.h"
+ #include "ggml-metal-fusion.h"
+ 
+@@ -5,6 +6,7 @@
  #include "ggml-impl.h"
  #include "ggml-backend-impl.h"
  
@@ -49,12 +52,10 @@
  #include <vector>
  
  // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
-@@ -41,12 +42,51 @@
+@@ -41,12 +43,51 @@
             has_simdgroup_mm && ne11 > 8 && ne00 >= 32;
  }
  
-+// Inkling W4A8: which weight type the int8 prefill kernel handles for this op (0 q4_K,
-+// 1 q5_0, 2 q8_0), or -1. Shared by buffer sizing and dispatch so both agree.
 +int ggml_metal_op_inkling_w4a8(const struct ggml_tensor * op) {
 +    static const bool on = std::getenv("INKLING_W4A8") != nullptr;
 +    if (!on) return -1;
@@ -69,9 +70,13 @@
 +        case GGML_TYPE_Q4_K: type = K % 256 == 0 ? 0 : -1; break;
 +        case GGML_TYPE_Q5_0: type = K % 64  == 0 ? 1 : -1; break;
 +        case GGML_TYPE_Q8_0: type = K % 64  == 0 ? 2 : -1; break;
++        case GGML_TYPE_IQ4_NL: type = K % 64 == 0 ? 3 : -1; break;
 +        default: return -1;
 +    }
 +    if (type < 0 || a->ne[1] % 64 != 0 || op->ne[0] != a->ne[1]) return -1;
++    static const bool g64 = std::getenv("INKLING_W4A8_G64") != nullptr;
++    if (g64 && type != 0 && type != 3) return -1;
++    if (g64 && strncmp(a->name, "output", 6) == 0) return -1;
 +    if (op->op == GGML_OP_MUL_MAT) {
 +        if (a->ne[2] != 1 || b->ne[2] != 1 || b->ne[1] < 32 || !ggml_is_contiguous(op)) return -1;
 +    } else {
@@ -93,8 +98,6 @@
      const int64_t ne21 = op->src[2]->ne[1];
  
 -    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
-+    // The verification probe tests grouped expert tiles on 4–31 nearby tokens.
-+    // Select once before buffer sizing and execution so both use the same path.
 +    static const bool group_short = std::getenv("INKLING_GROUP_SHORT_EXPERTS") != nullptr;
 +    const bool compatible = ne02 == 128 && op->src[2]->ne[0] == 8;
 +    const int min_tokens = group_short && compatible ? 4 : 32;
@@ -102,8 +105,8 @@
  }
  
  // the most src1 rows of the few-row MMA kernels
---- a/ggml/src/ggml-metal/ggml-metal-common.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-common.h	2026-11-22 19:03:01.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal-common.h
++++ b/ggml/src/ggml-metal/ggml-metal-common.h
 @@ -53,6 +53,8 @@
  // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
  bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);
@@ -113,8 +116,8 @@
  bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
  
  bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
---- a/ggml/src/ggml-metal/ggml-metal-context.m	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-context.m	2026-11-22 13:33:00.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
 @@ -1,3 +1,4 @@
 +#include <float.h>
  #import "ggml-metal-context.h"
@@ -167,7 +170,66 @@
      // number of nodes encoded by the main thread (empirically determined)
      const int n_main = MAX(64, 0.1*gf->n_nodes);
  
-@@ -605,6 +625,10 @@
+@@ -497,6 +517,58 @@
+     //
+     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
+ 
++    const bool op_profile = getenv("INKLING_OP_PROFILE") != NULL;
++    if (op_profile && gf->n_nodes >= 1000) {
++        if (ctx->cmd_buf_last) { [ctx->cmd_buf_last waitUntilCompleted]; ctx->cmd_buf_last = nil; }
++        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++        enum { NK = 128 };
++        static char keys[NK][96]; static double tms[NK]; static int cnt[NK]; static int nk = 0; static int ngraph = 0;
++        double total = 0;
++        for (int i = 0; i < gf->n_nodes; ) {
++            if (ggml_op_is_empty(gf->nodes[i]->op) || ggml_is_empty(gf->nodes[i])) { ++i; continue; }
++            int res = 1;
++            @autoreleasepool {
++                id<MTLCommandBuffer> cb = [queue commandBuffer];
++                ggml_metal_op_t op = ggml_metal_op_init(ctx->dev, cb, gf, ctx->finfo, i, gf->n_nodes, false, false, 0);
++                res = ggml_metal_op_encode(op, 0);
++                ggml_metal_op_free(op);
++                [cb commit];
++                [cb waitUntilCompleted];
++                const double t = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
++                struct ggml_tensor * n = ggml_graph_node(gf, i);
++                char key[96];
++                if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0])
++                    snprintf(key, sizeof(key), "%s %s %lldx%lld%s", ggml_op_desc(n), ggml_type_name(n->src[0]->type),
++                             (long long) n->src[0]->ne[0], (long long) n->src[0]->ne[1], res > 1 ? " +fused" : "");
++                else if (n->op == GGML_OP_CUSTOM) {
++                    char nm[64]; int j = 0;
++                    for (const char * c = n->name; *c && j < 60; ++c) if (!(*c >= '0' && *c <= '9')) nm[j++] = *c;
++                    nm[j] = 0;
++                    snprintf(key, sizeof(key), "%s[%s] %lldx%lld%s", ggml_op_desc(n), nm, (long long) n->ne[0], (long long) n->ne[1], res > 1 ? " +fused" : "");
++                } else
++                    snprintf(key, sizeof(key), "%s%s", ggml_op_desc(n), res > 1 ? " +fused" : "");
++                int k = 0;
++                while (k < nk && strcmp(keys[k], key) != 0) ++k;
++                if (k == nk && nk < NK) { strcpy(keys[nk], key); tms[nk] = 0; cnt[nk] = 0; ++nk; }
++                if (k < NK) { tms[k] += t; cnt[k] += 1; }
++                total += t;
++            }
++            if (res <= 0) break;
++            for (int left = res; i < gf->n_nodes && left > 0; ++i) {
++                if (!ggml_op_is_empty(gf->nodes[i]->op) && !ggml_is_empty(gf->nodes[i])) --left;
++            }
++        }
++        ++ngraph;
++        fprintf(stderr, "INKLING_OP_PROFILE graph %d nodes=%d gpu_ms=%.2f\n", ngraph, gf->n_nodes, total);
++        if (getenv("INKLING_OP_PROFILE")[0] == '2' || ngraph % 4 == 0) {
++            double all = 0; for (int k = 0; k < nk; ++k) all += tms[k];
++            int ord[NK]; for (int k = 0; k < nk; ++k) ord[k] = k;
++            for (int a = 0; a < nk; ++a) for (int b = a + 1; b < nk; ++b) if (tms[ord[b]] > tms[ord[a]]) { int t = ord[a]; ord[a] = ord[b]; ord[b] = t; }
++            for (int a = 0; a < nk; ++a) fprintf(stderr, "  %6.2f%% %10.2f ms %7d  %s\n", 100 * tms[ord[a]] / all, tms[ord[a]], cnt[ord[a]], keys[ord[a]]);
++        }
++        return GGML_STATUS_SUCCESS;
++    }
++
+     @autoreleasepool {
+         ctx->gf = gf;
+ 
+@@ -605,6 +677,10 @@
          }
  
          dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
@@ -178,7 +240,7 @@
  
          // for debugging: block until graph is computed
          //[ctx->cmd_buf_last waitUntilCompleted];
-@@ -728,6 +752,9 @@
+@@ -728,6 +804,9 @@
  }
  
  void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
@@ -188,7 +250,7 @@
      // when fusion stats are collected the graph must be encoded by a single thread so the
      // counters are race-free; override whatever the caller requested
      if (ggml_metal_fusion_info_stats(ctx->finfo)) {
-@@ -791,6 +818,7 @@
+@@ -791,6 +870,7 @@
  void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {
      ctx->abort_callback = abort_callback;
      ctx->abort_callback_data = user_data;
@@ -196,8 +258,8 @@
  }
  
  bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
---- a/ggml/src/ggml-metal/ggml-metal.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal.cpp	2026-11-22 19:04:06.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
 @@ -7,6 +7,7 @@
  #include "ggml-metal-fusion.h"
  #include "ggml-metal-context.h"
@@ -218,8 +280,8 @@
              } break;
          case GGML_OP_FLASH_ATTN_EXT:
              {
---- a/ggml/src/ggml-metal/ggml-metal-device.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-device.cpp	2026-11-23 00:04:56.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
 @@ -6,7 +6,10 @@
  
  #include "ggml-impl.h"
@@ -231,12 +293,11 @@
  #include <memory>
  #include <string>
  #include <unordered_map>
-@@ -1265,17 +1268,31 @@
+@@ -1265,17 +1268,30 @@
      return res;
  }
  
 -ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
-+// INKLING_MOE64=32|64: 64-token expert tiles with the given K strip on neural-accelerator GPUs
 +int ggml_metal_inkling_moe64_kt(const ggml_tensor * op, bool has_tensor) {
 +    const char * setting = std::getenv("INKLING_MOE64");
 +    if (!setting || !has_tensor || op->op != GGML_OP_MUL_MAT_ID) return 0;
@@ -265,7 +326,7 @@
  
          res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
  
-@@ -1307,21 +1324,54 @@
+@@ -1307,21 +1323,54 @@
  
      const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
  
@@ -323,7 +384,7 @@
  
      return res;
  }
-@@ -1530,6 +1580,16 @@
+@@ -1530,6 +1579,16 @@
              }
      };
  
@@ -340,7 +401,7 @@
      snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
      snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
  
-@@ -1900,11 +1960,12 @@
+@@ -1900,11 +1959,12 @@
  
      const int32_t dk = (int32_t) op->src[1]->ne[0];
      const int32_t dv = (int32_t) op->src[2]->ne[0];
@@ -354,7 +415,7 @@
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
      if (!res.pipeline) {
-@@ -1914,6 +1975,7 @@
+@@ -1914,6 +1974,7 @@
          ggml_metal_cv_set_bool(cv, has_sinks, FC_FLASH_ATTN_EXT_TENSOR + 1);
          ggml_metal_cv_set_bool(cv, has_bias,  FC_FLASH_ATTN_EXT_TENSOR + 2);
          ggml_metal_cv_set_bool(cv, has_scap,  FC_FLASH_ATTN_EXT_TENSOR + 3);
@@ -362,8 +423,8 @@
  
          res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
  
---- a/ggml/src/ggml-metal/ggml-metal-device.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-device.h	2026-11-22 23:37:45.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
 @@ -140,7 +140,8 @@
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -374,8 +435,8 @@
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_zero    (ggml_metal_library_t lib);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
---- a/ggml/src/ggml-metal/ggml-metal-device.m	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-device.m	2026-11-23 01:30:30.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
 @@ -4,6 +4,7 @@
  #import "ggml-impl.h"
  #import "ggml-backend-impl.h"
@@ -389,7 +450,7 @@
                  op->type == GGML_TYPE_F32 &&
                  ggml_is_contiguous_rows(op->src[0]);
 +        case GGML_OP_CUSTOM:
-+            return (has_simdgroup_reduction && ggml_is_inkling_depth_mix(op)) || ggml_is_inkling_relative_mask(op) || ggml_is_inkling_relative_bias_mask(op) || ggml_is_inkling_situ(op) || (has_simdgroup_reduction && ggml_is_inkling_clip(op)) || ggml_is_inkling_gate_merge(op) || ggml_is_inkling_conv(op) || ggml_is_inkling_conv_step(op) || (has_simdgroup_reduction && (ggml_is_inkling_ctrl_down(op) || ggml_is_inkling_ctrl_merge(op)));
++            return (has_simdgroup_reduction && ggml_is_inkling_depth_mix(op)) || ggml_is_inkling_relative_mask(op) || ggml_is_inkling_relative_bias_mask(op) || ggml_is_inkling_situ(op) || (has_simdgroup_reduction && ggml_is_inkling_clip(op)) || ggml_is_inkling_gate_merge(op) || ggml_is_inkling_conv(op) || ggml_is_inkling_conv_step(op) || ggml_is_inkling_conv_prefill(op) || (has_simdgroup_reduction && (ggml_is_inkling_ctrl_down(op) || ggml_is_inkling_ctrl_merge(op)));
          case GGML_OP_COUNT_EQUAL:
              return has_simdgroup_reduction &&
                  op->src[0]->type == GGML_TYPE_I32 &&
@@ -403,44 +464,42 @@
              // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
              if (op->src[5] != NULL) {
                  const struct ggml_tensor * kv_rows = op->src[5];
---- a/ggml/src/ggml-metal/ggml-metal-impl.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-impl.h	2026-11-22 19:02:34.000000000 +0800
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
 @@ -463,6 +463,7 @@
      float    m1;
      int32_t  n_head_log2;
      float    logit_softcap;
-+    int32_t  rel_extent; // relative buckets 0..rel_extent; bucket rel_extent is "far"
++    int32_t  rel_extent;
  } ggml_metal_kargs_flash_attn_ext;
  
  typedef struct {
-@@ -612,6 +613,18 @@
-     int16_t  r3;
+@@ -613,6 +614,16 @@
  } ggml_metal_kargs_mul_mm_id;
  
-+// Inkling W4A8: int8 activations with one scale per 32 values, plus the scaled sum of
-+// each block's int8 codes (for the weight minimum). Laid out after the op's other scratch.
-+typedef struct {
+ typedef struct {
 +    int32_t  K;
 +    int32_t  ne11;
 +    int32_t  nrows;
 +    uint64_t nb11;
 +    uint64_t nb12;
-+    uint64_t off_s;  // byte offset of the float scales [nrows][K/32]
-+    uint64_t off_m;  // byte offset of the float scaled sums [nrows][K/32]
++    uint64_t off_s;
++    uint64_t off_m;
 +} ggml_metal_kargs_inkling_a8;
 +
- typedef struct {
++typedef struct {
      int32_t  nei0;
      int32_t  nei1;
---- a/ggml/src/ggml-metal/ggml-metal-ops.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp	2026-11-23 01:30:30.000000000 +0800
+     uint64_t nbi1;
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -1,4 +1,5 @@
  #include "ggml-metal-ops.h"
 +#include "ggml-inkling.h"
  
  #include "ggml.h"
  #include "ggml-impl.h"
-@@ -355,6 +356,163 @@
+@@ -355,6 +356,182 @@
              {
                  n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
              } break;
@@ -463,6 +522,25 @@
 +                    }
 +                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(out), 7);
 +                    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (shape[0] + 127) / 128, 1, 1, 128, 1, 1);
++                    n_fuse = 1;
++                    break;
++                }
++                if (ggml_is_inkling_conv_prefill(out)) {
++                    const char * name = "kernel_inkling_shortconv_prefill";
++                    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
++                    if (!pipeline.pipeline) pipeline = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
++                    const auto * taps = out->src[4];
++                    uint32_t shape[] = { (uint32_t) out->ne[0], (uint32_t) out->ne[1], taps ? (uint32_t) taps->ne[0] / 4 : 0u };
++                    float scale = 1.0f / sqrtf(taps ? 9.0f : 5.0f);
++                    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
++                    ggml_metal_encoder_set_bytes(ctx->enc, shape, sizeof(shape), 0);
++                    ggml_metal_encoder_set_bytes(ctx->enc, &scale, sizeof(scale), 1);
++                    for (int i = 0; i < 5; ++i) {
++                        auto * arg = out->src[i] ? out->src[i] : out->src[2];
++                        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(arg), i + 2);
++                    }
++                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(out), 7);
++                    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (shape[0] * shape[1] + 127) / 128, 1, 1, 128, 1, 1);
 +                    n_fuse = 1;
 +                    break;
 +                }
@@ -604,44 +682,49 @@
          case GGML_OP_SOFT_MAX:
              {
                  n_fuse = ggml_metal_op_soft_max(ctx, idx);
-@@ -2727,6 +2885,80 @@
+@@ -2727,6 +2904,86 @@
      return 1;
  }
  
-+// Inkling W4A8: quantize src1 into the op's scratch, then run the int8 neural-accelerator kernel.
 +static ggml_metal_kargs_inkling_a8 inkling_a8_args(const ggml_tensor * op, ggml_metal_buffer_id & bid_qa) {
 +    bid_qa.offs = (bid_qa.offs + 15) & ~(size_t) 15;
 +    const int64_t K = op->src[0]->ne[0];
 +    const int64_t nrows = op->src[1]->ne[1] * op->src[1]->ne[2];
 +    ggml_metal_kargs_inkling_a8 a8 = {
-+        /*.K     =*/ (int32_t) K,
-+        /*.ne11  =*/ (int32_t) op->src[1]->ne[1],
-+        /*.nrows =*/ (int32_t) nrows,
-+        /*.nb11  =*/ op->src[1]->nb[1],
-+        /*.nb12  =*/ op->src[1]->nb[2],
-+        /*.off_s =*/ (uint64_t) (nrows * K),
-+        /*.off_m =*/ (uint64_t) (nrows * K + nrows * (K / 32) * sizeof(float)),
++        (int32_t) K,
++        (int32_t) op->src[1]->ne[1],
++        (int32_t) nrows,
++        op->src[1]->nb[1],
++        op->src[1]->nb[2],
++        (uint64_t) (nrows * K),
++        (uint64_t) (nrows * K + nrows * (K / 32) * sizeof(float)),
 +    };
 +    return a8;
 +}
 +
 +static void inkling_a8_quant(ggml_metal_op_t ctx, const ggml_tensor * op, const ggml_metal_kargs_inkling_a8 & a8, ggml_metal_buffer_id bid_qa) {
-+    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, "kernel_inkling_quant_a8");
-+    if (!pipeline.pipeline) pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "kernel_inkling_quant_a8", "kernel_inkling_quant_a8", nullptr);
++    static const bool g64 = std::getenv("INKLING_W4A8_G64") != nullptr;
++    const char * qn = g64 ? "kernel_inkling_quant_a8g64" : "kernel_inkling_quant_a8";
++    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, qn);
++    if (!pipeline.pipeline) pipeline = ggml_metal_library_compile_pipeline(ctx->lib, qn, qn, nullptr);
 +    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
 +    ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &a8, sizeof(a8), 0);
 +    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 1);
 +    ggml_metal_encoder_set_buffer  (ctx->enc, bid_qa, 2);
-+    const int n = a8.nrows * (a8.K / 32);
++    const int n = a8.nrows * (a8.K / (g64 ? 64 : 32));
 +    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + 255) / 256, 1, 1, 256, 1, 1);
 +}
 +
 +static void inkling_w4a8_mm(ggml_metal_op_t ctx, const ggml_tensor * op, int type, bool id,
 +        const ggml_metal_kargs_mul_mm_id & args, const ggml_metal_kargs_inkling_a8 & a8,
 +        ggml_metal_buffer_id bid_tpe, ggml_metal_buffer_id bid_ids, ggml_metal_buffer_id bid_qa, int grid_x) {
-+    static const char * tn[3] = {"q4_K", "q5_0", "q8_0"};
++    static const char * tn[4] = {"q4_K", "q5_0", "q8_0", "iq4_nl"};
++    static const bool g64 = std::getenv("INKLING_W4A8_G64") != nullptr;
 +    char name[128];
-+    snprintf(name, sizeof(name), "kernel_inkling_w4a8_%s_%s", id ? "id" : "mm", tn[type]);
++    static const bool t64 = g64 && std::getenv("INKLING_W4A8_T64") != nullptr;
++    static const bool pipe = g64 && std::getenv("INKLING_W4A8_PIPE") != nullptr;
++    static const bool adapt = t64 && std::getenv("INKLING_W4A8_ADAPT") != nullptr;
++    snprintf(name, sizeof(name), "kernel_inkling_w4a8%s%s%s_%s_%s", g64 ? "g64" : "", pipe ? "p" : "", (adapt && id) ? "a" : (t64 ? "t" : ""), id ? "id" : "mm", tn[type]);
 +    if (std::getenv("INKLING_W4A8_LOG")) {
 +        fprintf(stderr, "INKLING_W4A8 %s m=%lld k=%lld n=%lld x%lld\n", name, (long long) op->src[0]->ne[1],
 +                (long long) op->src[0]->ne[0], (long long) op->src[1]->ne[1], (long long) op->src[1]->ne[2]);
@@ -657,7 +740,8 @@
 +    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op), 5);
 +    ggml_metal_encoder_set_buffer  (ctx->enc, bid_qa, 6);
 +    ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &a8, sizeof(a8), 7);
-+    ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 8192, 0);
++    ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, pipe ? (t64 ? 18432 : 13824) : (t64 ? 16384 : 8192), 0);
++    if (t64 && !id) grid_x = (op->ne[1] + 63) / 64;
 +    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, grid_x, op->src[0]->ne[1] / 64, 1, 128, 1, 1);
 +}
 +
@@ -685,7 +769,7 @@
  int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
      ggml_tensor * op = ctx->node(idx);
  
-@@ -2739,6 +2971,13 @@
+@@ -2739,6 +2996,13 @@
          return ggml_metal_op_fwht(ctx, idx);
      }
  
@@ -699,7 +783,7 @@
      if (props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_mma(op)) {
          return ggml_metal_op_mul_mat_mma(ctx, idx);
      }
-@@ -2999,7 +3238,38 @@
+@@ -2999,7 +3263,37 @@
          ggml_metal_buffer_id bid_ids = bid_tpe;
          bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
  
@@ -715,10 +799,9 @@
 +
 +        if (std::getenv("INKLING_ROUTE_MAP") && ne02 == 128 && ne20 == 8 &&
 +            ggml_is_contiguous(op->src[2]) && ne21 <= 4096) {
-+            // Work one SIMD group per expert, retaining token/slot order within every tile.
 +            uint32_t entries = uint32_t(ne20 * ne21);
 +            auto counts = bid_ids;
-+            counts.offs += entries * sizeof(int32_t);  // unused padding at the end of the compact ID list
++            counts.offs += entries * sizeof(int32_t);
 +            auto init = ggml_metal_library_get_pipeline(lib, "kernel_inkling_route_init");
 +            if (!init.pipeline) init = ggml_metal_library_compile_pipeline(lib, "kernel_inkling_route_init", "kernel_inkling_route_init", nullptr);
 +            ggml_metal_encoder_set_pipeline(enc, init);
@@ -739,44 +822,45 @@
              ggml_metal_kargs_mul_mm_id_map0 args = {
                  ne10,
                  ne11, // n_expert_used (bcast)
-@@ -3010,7 +3280,7 @@
+@@ -3010,7 +3304,8 @@
                  nb21,
              };
  
 -            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
-+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, w4a8 < 0 && ggml_metal_inkling_moe64_kt(op, props_dev->has_tensor) != 0);
++            static const bool w4a8_t64 = std::getenv("INKLING_W4A8_G64") && std::getenv("INKLING_W4A8_T64");
++            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20, w4a8 >= 0 ? w4a8_t64 : ggml_metal_inkling_moe64_kt(op, props_dev->has_tensor) != 0);
  
              const size_t smem = pipeline.smem;
  
-@@ -3051,7 +3321,26 @@
+@@ -3051,7 +3346,26 @@
          // this barrier is always needed because the next kernel has to wait for the id maps to be computed
          ggml_metal_op_concurrency_reset(ctx);
  
 -        {
 +        if (w4a8 >= 0) {
 +            ggml_metal_kargs_mul_mm_id args = {
-+                /*.ne00  =*/ ne00,
-+                /*.ne02  =*/ ne02,
-+                /*.nb01  =*/ nb01,
-+                /*.nb02  =*/ nb02,
-+                /*.nb03  =*/ nb03,
-+                /*.ne11  =*/ ne11,
-+                /*.nb10  =*/ nb10,
-+                /*.nb11  =*/ nb11,
-+                /*.nb12  =*/ nb12,
-+                /*.nb13  =*/ nb13,
-+                /*.ne20  =*/ ne20,
-+                /*.ne0   =*/ ne0,
-+                /*.ne1   =*/ ne1,
-+                /*.r2    =*/ (int16_t) r2,
-+                /*.r3    =*/ (int16_t) r3,
++                ne00,
++                ne02,
++                nb01,
++                nb02,
++                nb03,
++                ne11,
++                nb10,
++                nb11,
++                nb12,
++                nb13,
++                ne20,
++                ne0,
++                ne1,
++                (int16_t) r2,
++                (int16_t) r3,
 +            };
 +            inkling_w4a8_mm(ctx, op, w4a8, true, args, a8, bid_tpe, bid_ids, bid_qa, (int) ggml_metal_op_mul_mat_id_max_tiles(op));
 +        } else {
              auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
  
              ggml_metal_kargs_mul_mm_id args = {
-@@ -3088,7 +3377,8 @@
+@@ -3088,7 +3402,8 @@
  
              const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
  
@@ -786,25 +870,24 @@
          }
      } else {
          auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
-@@ -3840,6 +4130,9 @@
+@@ -3840,6 +4155,8 @@
          }
      }
  
-+    // the relative bias is only implemented in the tensor kernel; graphs request it only for wide batches
 +    GGML_ASSERT(op->src[6] == nullptr || (!use_sparse && ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor)));
 +
      if (!use_sparse && ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor)) {
          // tensor API kernel
          const int nqptg = ne00 >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG; // queries per threadgroup
-@@ -3911,6 +4204,7 @@
+@@ -3911,6 +4228,7 @@
              /*.m1            =*/ m1,
              /*.n_head_log2   =*/ n_head_log2,
              /*.logit_softcap =*/ logit_softcap,
-+            /*.rel_extent    =*/ op->src[6] ? (int32_t) op->src[6]->ne[0] - 1 : 0,
++            op->src[6] ? (int32_t) op->src[6]->ne[0] - 1 : 0,
          };
  
          // shared memory layout: queries (16-bit), scores (float), probabilities (16-bit), row scale (float), rescale flag (int)
-@@ -3930,6 +4224,15 @@
+@@ -3930,6 +4248,15 @@
          ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
          ggml_metal_encoder_set_buffer  (enc, bid_blk,  6);
          ggml_metal_encoder_set_buffer  (enc, bid_dst,  7);
@@ -820,8 +903,8 @@
  
          ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
  
---- a/ggml/src/ggml-metal/kernels/fa_tensor.metal	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/kernels/fa_tensor.metal	2026-11-22 17:38:01.000000000 +0800
+--- a/ggml/src/ggml-metal/kernels/fa_tensor.metal
++++ b/ggml/src/ggml-metal/kernels/fa_tensor.metal
 @@ -6,6 +6,7 @@
  constant bool FC_flash_attn_ext_tensor_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 1)]];
  constant bool FC_flash_attn_ext_tensor_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_TENSOR + 2)]];
@@ -840,11 +923,10 @@
          threadgroup  char * shmem [[threadgroup(0)]],
          uint3  tgpig [[threadgroup_position_in_grid]],
          ushort tiisg [[thread_index_in_simdgroup]],
-@@ -185,6 +189,17 @@
+@@ -185,6 +189,16 @@
                  }
              }
  
-+            // relative bias, gathered by distance; rounded to half like the per-head mask it replaces
 +            if (FC_flash_attn_ext_tensor_has_rel && iq1 + j < args.ne01) {
 +                const int E  = args.rel_extent;
 +                const int qp = qpos[iq1 + j];
@@ -858,15 +940,13 @@
              float m = M[jj];
  
              FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
---- a/ggml/src/ggml-metal/kernels/misc.metal	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/kernels/misc.metal	2026-11-23 01:30:30.000000000 +0800
-@@ -1002,3 +1002,239 @@
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -1002,3 +1002,259 @@
  
  template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
  template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
 +
-+// Each SIMD group handles a residual state for one token and one query.
-+// Reduce RMS and query dot products together, then mix the original vectors.
 +kernel void kernel_inkling_depth_mix(
 +        constant int * args [[buffer(0)]], device const float4 * queries [[buffer(1)]],
 +        device const float4 * s0 [[buffer(2)]], device const float4 * s1 [[buffer(3)]],
@@ -920,7 +1000,6 @@
 +    output[(p.z * queries + p.y) * keys + p.x] = half(bias + float(causal[pos]));
 +}
 +
-+// One threadgroup: 128 keys of one query. Each thread reads its bias column once and writes all heads.
 +kernel void kernel_inkling_relative_bias_mask(
 +        constant int * args [[buffer(0)]], device const float4 * bias [[buffer(1)]],
 +        device const float4 * r [[buffer(2)]], device const float * sinks [[buffer(3)]],
@@ -965,7 +1044,6 @@
 +    dst[id] = scaled * limited;
 +}
 +
-+// The stock SUM_ROWS(F32) uses a componentwise float4 SIMD reduction at these widths.
 +kernel void kernel_inkling_clip(
 +        constant uint * shape [[buffer(0)]], constant float & threshold [[buffer(1)]],
 +        device const float4 * x [[buffer(2)]], device float4 * output [[buffer(3)]],
@@ -1020,8 +1098,6 @@
 +    out[i] = with_residual * scale;
 +}
 +
-+// Fused single-token loop controller, part 1: z[r] = W[r] . concat(rms(cur), rms(msg)).
-+// One 128-thread threadgroup per output row; every group recomputes the two RMS factors.
 +template <typename T4>
 +kernel void kernel_inkling_ctrl_down(
 +        constant uint & h [[buffer(0)]], device const float4 * cur [[buffer(1)]],
@@ -1053,7 +1129,6 @@
 +template [[host_name("kernel_inkling_ctrl_down_f32")]] kernel kernel_inkling_ctrl_down_f32_t kernel_inkling_ctrl_down<float4>;
 +template [[host_name("kernel_inkling_ctrl_down_f16")]] kernel kernel_inkling_ctrl_down_f16_t kernel_inkling_ctrl_down<half4>;
 +
-+// Part 2: one SIMD group per hidden channel: gain and forget rows (64 wide) against z, then the merge.
 +template <typename T2>
 +kernel void kernel_inkling_ctrl_merge(
 +        constant uint & h [[buffer(0)]], device const float * cur [[buffer(1)]],
@@ -1076,8 +1151,35 @@
 +template [[host_name("kernel_inkling_ctrl_merge_f32")]] kernel kernel_inkling_ctrl_merge_f32_t kernel_inkling_ctrl_merge<float2>;
 +template [[host_name("kernel_inkling_ctrl_merge_f16")]] kernel kernel_inkling_ctrl_merge_f16_t kernel_inkling_ctrl_merge<half2>;
 +
-+// Single-token short convolution: same arithmetic as kernel_inkling_shortconv, and the
-+// shifted history (last three inputs) is written back to the recurrent-state slot.
++kernel void kernel_inkling_shortconv_prefill(
++        constant uint * shape [[buffer(0)]], constant float & scale [[buffer(1)]],
++        device const float * past [[buffer(2)]], device const float4 * weights [[buffer(3)]],
++        device const float * cur [[buffer(4)]], device float * cell [[buffer(5)]],
++        device const float4 * taps [[buffer(6)]], device float * out [[buffer(7)]],
++        uint i [[thread_position_in_grid]]) {
++    const uint channels = shape[0], tokens = shape[1], heads = shape[2];
++    if (i >= channels * tokens) return;
++    const uint c = i % channels, t = i / channels;
++    float v[4];
++    for (uint k = 0; k < 4; ++k) {
++        const uint p = t + k;
++        v[k] = p < 3 ? past[3 * c + p] : cur[(p - 3) * channels + c];
++    }
++    const float4 window = float4(v[0], v[1], v[2], v[3]);
++    volatile thread float value = dot(window, weights[c]);
++    if (heads) {
++        const float4 coeff = taps[t * heads + c / (channels / heads)];
++        volatile thread float4 terms = window.wzyx * coeff;
++        value = value + terms.x;
++        value = value + terms.y;
++        value = value + terms.z;
++        value = value + terms.w;
++    }
++    volatile thread float with_residual = cur[i] + value;
++    out[i] = with_residual * scale;
++    if (t + 3 >= tokens) cell[3 * c + (t + 3 - tokens)] = window.w;
++}
++
 +kernel void kernel_inkling_shortconv_step(
 +        constant uint * shape [[buffer(0)]], constant float & scale [[buffer(1)]],
 +        device const float * past [[buffer(2)]], device const float4 * weights [[buffer(3)]],
@@ -1100,8 +1202,8 @@
 +    out[c] = with_residual * scale;
 +    cell[3 * c] = window.y; cell[3 * c + 1] = window.z; cell[3 * c + 2] = window.w;
 +}
---- a/ggml/src/ggml-metal/kernels/mul_mm.metal	2026-11-22 00:24:19.000000000 +0800
-+++ b/ggml/src/ggml-metal/kernels/mul_mm.metal	2026-11-23 00:04:56.000000000 +0800
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
 @@ -8,6 +8,8 @@
  constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
  constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
@@ -1116,7 +1218,7 @@
      // entry tile descriptors of kernel_mul_mm_id: (expert, first entry, valid rows) per tile
      if (tpitg == 0) {
 -        constexpr uint32_t NTILE = 32; // must match NR1 of kernel_mul_mm_id
-+        const uint32_t NTILE = FC_mul_mm_id_map0_t64_on ? 64 : 32; // must match the token tile of the consumer
++        const uint32_t NTILE = FC_mul_mm_id_map0_t64_on ? 64 : 32;
  
          uint32_t base = 0;
          uint32_t tile = 0;
@@ -1165,13 +1267,11 @@
  // kernel_mul_mm_id only writes the rows that an expert owns, so the skipped rows are zeroed here
  kernel void kernel_mul_mm_id_zero(
          constant ggml_metal_kargs_mul_mm_id_zero & args,
-@@ -1016,3 +1056,648 @@
+@@ -1016,3 +1056,1135 @@
  template [[host_name("kernel_mul_mm_id_iq4_nl_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
  template [[host_name("kernel_mul_mm_id_iq4_xs_f16")]]  kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
  template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_mul_mm_id<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  half, half2x4>;
 +
-+// Inkling Q4_K_M uses these three expert weight types. Stage a longer
-+// K strip per neural-accelerator invocation while retaining the same route map.
 +#ifdef GGML_METAL_HAS_TENSOR
 +template<int KT, typename W, short chunks, void (*dequant)(device const W *, short, thread half4x4 &)>
 +kernel void kernel_inkling_moe(
@@ -1241,7 +1341,6 @@
 +        *(device float4 *)dest = *(threadgroup float4 *)(c + row * 64 + offset);
 +    }
 +}
-+// Expert products with a 64-token x 64-row tile and one neural-accelerator matmul per K strip.
 +template<int KT, typename W, short chunks, void (*dequant)(device const W *, short, thread half4x4 &), int MODE = 0>
 +kernel void kernel_inkling_moe64(
 +        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
@@ -1263,7 +1362,6 @@
 +    auto c0 = mm.template get_destination_cooperative_tensor<decltype(ta), decltype(tb), float>();
 +    constexpr uint chunks_a = KT / 16;
 +    constexpr uint chunks_b = KT / 8;
-+    // per-thread source rows, fixed over K
 +    device const W * wrow[64 * chunks_a / 128];
 +    uint woff[64 * chunks_a / 128];
 +    FOR_UNROLL (uint j = 0; j < 64 * chunks_a / 128; ++j) {
@@ -1324,7 +1422,6 @@
 +template [[host_name("kernel_inkling_moe64_k64_iq4_nl_m1")]] kernel inkling_moe64_fn kernel_inkling_moe64<64, block_iq4_nl, 2,     dequantize_iq4_nl, 1>;
 +template [[host_name("kernel_inkling_moe64_k64_q4_K_m2")]]   kernel inkling_moe64_fn kernel_inkling_moe64<64, block_q4_K,   QK_NL, dequantize_q4_K, 2>;
 +template [[host_name("kernel_inkling_moe64_k64_iq4_nl_m2")]] kernel inkling_moe64_fn kernel_inkling_moe64<64, block_iq4_nl, 2,     dequantize_iq4_nl, 2>;
-+// Double-buffered variant: the next K strip is dequantized while the accelerator multiplies the current one.
 +template<int KT, typename W, short chunks, void (*dequant)(device const W *, short, thread half4x4 &)>
 +kernel void kernel_inkling_moe64db(
 +        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
@@ -1417,7 +1514,6 @@
 +template [[host_name("kernel_inkling_moe64db_k64_iq4_nl")]] kernel inkling_moe64db_fn kernel_inkling_moe64db<64, block_iq4_nl, 2,     dequantize_iq4_nl>;
 +template [[host_name("kernel_inkling_moe64db_k64_q5_0")]]   kernel inkling_moe64db_fn kernel_inkling_moe64db<64, block_q5_0,   2,     dequantize_q5_0>;
 +template [[host_name("kernel_inkling_moe64db_k64_q8_0")]]   kernel inkling_moe64db_fn kernel_inkling_moe64db<64, block_q8_0,   2,     dequantize_q8_0>;
-+// Warp-specialized: SIMD groups 4-7 dequantize the next K strip while groups 0-3 run the accelerator on the current one.
 +template<int KT, typename W, short chunks, void (*dequant)(device const W *, short, thread half4x4 &)>
 +kernel void kernel_inkling_moe64ws(
 +        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
@@ -1512,7 +1608,6 @@
 +template [[host_name("kernel_inkling_moe64ws_k64_iq4_nl")]] kernel inkling_moe64ws_fn kernel_inkling_moe64ws<64, block_iq4_nl, 2, dequantize_iq4_nl>;
 +template [[host_name("kernel_inkling_moe64ws_k64_q5_0")]] kernel inkling_moe64ws_fn kernel_inkling_moe64ws<64, block_q5_0, 2, dequantize_q5_0>;
 +template [[host_name("kernel_inkling_moe64ws_k64_q8_0")]] kernel inkling_moe64ws_fn kernel_inkling_moe64ws<64, block_q8_0, 2, dequantize_q8_0>;
-+// Warp-specialized with 8 producer SIMD groups (4-11) that dequantize the next K strip while groups 0-3 run the accelerator on the current one.
 +template<int KT, typename W, short chunks, void (*dequant)(device const W *, short, thread half4x4 &)>
 +kernel void kernel_inkling_moe64wp(
 +        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
@@ -1616,11 +1711,6 @@
 +template [[host_name("kernel_inkling_moe_k128_q8_0")]] kernel inkling_moe_fn kernel_inkling_moe<128, block_q8_0, 2, dequantize_q8_0>;
 +#endif
 +
-+// ---------------------------------------------------------------------------------------------
-+// Inkling W4A8 prefill: int8 activations x the file's own integer weight codes on the M5
-+// neural accelerators (int8 x int8 -> int32), with the per-32 weight scale/minimum and
-+// activation scale applied after each 32-wide block. Weights are read in their GGUF layout.
-+// ---------------------------------------------------------------------------------------------
 +#ifdef GGML_METAL_HAS_TENSOR
 +kernel void kernel_inkling_quant_a8(
 +        constant ggml_metal_kargs_inkling_a8 & args,
@@ -1650,13 +1740,26 @@
 +
 +static inline float inkling_half(device const char * p) { return (float) *(device const half *) p; }
 +
-+// Stage 64 weight rows x 64 K values (two 32-blocks) as int8 codes plus per-block scale/minimum.
-+// Thread layout: row = tid/2, h = tid%2 picks the 16-value half of each block (q4_K: of the byte run).
++constant uchar inkling_kv_iq4nl[16] = {129, 152, 173, 191, 207, 221, 234, 246, 1, 13, 25, 38, 53, 69, 89, 113};
++
++static inline void inkling_iq4nl_unpack(device const ushort * qs, threadgroup uint * o) {
++    FOR_UNROLL (short i = 0; i < 4; ++i) {
++        const uint w = uint(qs[2 * i]) | (uint(qs[2 * i + 1]) << 16);
++        uint lo = 0, hi = 0;
++        FOR_UNROLL (short b = 0; b < 4; ++b) {
++            const uint byte = (w >> (8 * b)) & 0xFFu;
++            lo |= uint(inkling_kv_iq4nl[byte & 0xFu]) << (8 * b);
++            hi |= uint(inkling_kv_iq4nl[byte >> 4])   << (8 * b);
++        }
++        o[i] = lo; o[4 + i] = hi;
++    }
++}
++
 +template<short TYPE>
 +static inline void inkling_stage_w(device const char * row, int k0, short r, short h,
 +        threadgroup int8_t * wa0, threadgroup int8_t * wa1,
 +        threadgroup float * ws, threadgroup float * wm) {
-+    if (TYPE == 0) { // q4_K: 144-byte super-blocks of 256; byte i of pair p holds block 2p (low) and 2p+1 (high)
++    if (TYPE == 0) {
 +        device const char * blk = row + (k0 / 256) * 144;
 +        const short p = (k0 % 256) / 64;
 +        device const uint * qs = (device const uint *)(blk + 16 + 32 * p + 16 * h);
@@ -1675,7 +1778,7 @@
 +            ws[r] = d * a.x; wm[r] = dmin * a.y;
 +            ws[64 + r] = d * b.x; wm[64 + r] = dmin * b.y;
 +        }
-+    } else if (TYPE == 1) { // q5_0: 22-byte blocks of 32, w = d * (q - 16)
++    } else if (TYPE == 1) {
 +        FOR_UNROLL (short s = 0; s < 2; ++s) {
 +            device const uchar * blk = (device const uchar *)(row + (k0 / 32 + s) * 22);
 +            const uint qh = uint(blk[2]) | (uint(blk[3]) << 8) | (uint(blk[4]) << 16) | (uint(blk[5]) << 24);
@@ -1687,7 +1790,11 @@
 +            }
 +            if (h == 0) { ws[64 * s + r] = (float) *(device const half *) blk; wm[64 * s + r] = 0.0f; }
 +        }
-+    } else { // q8_0: 34-byte blocks of 32, w = d * q
++    } else if (TYPE == 3) {
++        device const ushort * blk = (device const ushort *)(row + (k0 / 32 + h) * 18);
++        inkling_iq4nl_unpack(blk + 1, (threadgroup uint *)((h ? wa1 : wa0) + r * 32));
++        ws[64 * h + r] = (float) as_type<half>(blk[0]); wm[64 * h + r] = 0.0f;
++    } else {
 +        FOR_UNROLL (short s = 0; s < 2; ++s) {
 +            device const char * blk = row + (k0 / 32 + s) * 34;
 +            device const ushort * q = (device const ushort *)(blk + 2 + 16 * h);
@@ -1698,8 +1805,6 @@
 +    }
 +}
 +
-+// ID: one route-map tile (one expert, <= 32 entries) x 64 weight rows per threadgroup.
-+// Dense: 32 tokens x 64 weight rows. Bindings follow kernel_mul_mm_id, plus qa (6) and a8 args (7).
 +template<short TYPE, bool ID>
 +kernel void kernel_inkling_w4a8(
 +        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
@@ -1725,10 +1830,10 @@
 +    threadgroup int8_t * wa1 = wa0 + 64 * 32;
 +    threadgroup int8_t * xb0 = wa1 + 64 * 32;
 +    threadgroup int8_t * xb1 = xb0 + 32 * 32;
-+    threadgroup float  * ws  = (threadgroup float *)(xb1 + 32 * 32); // [2][64]
-+    threadgroup float  * wm  = ws + 128;                             // [2][64]
-+    threadgroup float  * xs  = wm + 128;                             // [2][32]
-+    threadgroup float  * xm  = xs + 64;                              // [2][32]
++    threadgroup float  * ws  = (threadgroup float *)(xb1 + 32 * 32);
++    threadgroup float  * wm  = ws + 128;
++    threadgroup float  * xs  = wm + 128;
++    threadgroup float  * xm  = xs + 64;
 +
 +    auto ta0 = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(wa0, dextents<int32_t, 2>(32, 64));
 +    auto ta1 = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(wa1, dextents<int32_t, 2>(32, 64));
@@ -1738,11 +1843,10 @@
 +        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<4>> mm;
 +    auto ci = mm.template get_destination_cooperative_tensor<decltype(tb0), decltype(ta0), int32_t>();
 +
-+    constexpr int CAP = 16; // 32 x 64 outputs over 128 threads
++    constexpr int CAP = 16;
 +    float acc[CAP];
 +    FOR_UNROLL (short i = 0; i < CAP; ++i) acc[i] = 0.0f;
 +
-+    // activation row this thread stages: token t = tid/4, 16-byte chunk c = tid%4
 +    const short t = tid / 4, c = tid % 4;
 +    int arow = -1;
 +    if ((uint) t < rows) {
@@ -1786,7 +1890,7 @@
 +        threadgroup_barrier(mem_flags::mem_threadgroup);
 +    }
 +
-+    threadgroup float * cst = (threadgroup float *) scratch; // [32 tokens][64 rows]
++    threadgroup float * cst = (threadgroup float *) scratch;
 +    FOR_UNROLL (short i = 0; i < CAP; ++i) {
 +        if (ci.is_valid_element(i)) {
 +            auto idx = ci.get_multidimensional_index(i);
@@ -1813,9 +1917,494 @@
 +template [[host_name("kernel_inkling_w4a8_mm_q4_K")]] kernel inkling_w4a8_fn kernel_inkling_w4a8<0, false>;
 +template [[host_name("kernel_inkling_w4a8_mm_q5_0")]] kernel inkling_w4a8_fn kernel_inkling_w4a8<1, false>;
 +template [[host_name("kernel_inkling_w4a8_mm_q8_0")]] kernel inkling_w4a8_fn kernel_inkling_w4a8<2, false>;
++template [[host_name("kernel_inkling_w4a8_id_iq4_nl")]] kernel inkling_w4a8_fn kernel_inkling_w4a8<3, true>;
++template [[host_name("kernel_inkling_w4a8_mm_iq4_nl")]] kernel inkling_w4a8_fn kernel_inkling_w4a8<3, false>;
 +#endif
---- a/src/llama-graph.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/llama-graph.cpp	2026-11-22 23:32:11.000000000 +0800
++
++#ifdef GGML_METAL_HAS_TENSOR
++kernel void kernel_inkling_quant_a8g64(
++        constant ggml_metal_kargs_inkling_a8 & args,
++        device const char * src1,
++        device       char * qa,
++        uint gid [[thread_position_in_grid]]) {
++    const int G = args.K / 64;
++    if ((int) gid >= args.nrows * G) return;
++    const int row = gid / G, g = gid % G;
++    const int i11 = row % args.ne11, i12 = row / args.ne11;
++    device const float4 * x = (device const float4 *)(src1 + args.nb12 * i12 + args.nb11 * i11) + g * 16;
++    float4 v[16];
++    float amax = 0.0f;
++    FOR_UNROLL (short i = 0; i < 16; ++i) { v[i] = x[i]; const float4 av = abs(v[i]); amax = max(amax, max(max(av.x, av.y), max(av.z, av.w))); }
++    const float d = amax / 127.0f;
++    const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
++    device char4 * q = (device char4 *)(qa + (uint64_t) row * args.K + g * 64);
++    int sum = 0;
++    FOR_UNROLL (short i = 0; i < 16; ++i) {
++        const int4 c = clamp(int4(rint(v[i] * id)), -127, 127);
++        sum += c.x + c.y + c.z + c.w;
++        q[i] = char4(c);
++    }
++    ((device float *)(qa + args.off_s))[gid] = d;
++    ((device float *)(qa + args.off_m))[gid] = d * (float) sum;
++}
++
++
++
++template<short TYPE>
++static inline void inkling_stage_w64(device const char * row, int k0, short r, short h,
++        threadgroup int8_t * wa, threadgroup float * ws, threadgroup float * wm) {
++    if (TYPE == 0) {
++        device const char * blk = row + (k0 / 256) * 144;
++        const short p = (k0 % 256) / 64;
++        device const uint * qs = (device const uint *)(blk + 16 + 32 * p + 16 * h);
++        threadgroup uint * lo = (threadgroup uint *)(wa + r * 64 + 16 * h);
++        threadgroup uint * hi = (threadgroup uint *)(wa + r * 64 + 32 + 16 * h);
++        FOR_UNROLL (short i = 0; i < 4; ++i) {
++            const uint w = qs[i];
++            lo[i] = w & 0x0F0F0F0Fu;
++            hi[i] = (w >> 4) & 0x0F0F0F0Fu;
++        }
++        if (h == 0) {
++            const float d = inkling_half(blk), dmin = inkling_half(blk + 2);
++            device const uchar * sc = (device const uchar *)(blk + 4);
++            const uchar2 a = get_scale_min_k4_just2(2 * p, 0, sc);
++            ws[r] = d * a.x; wm[r] = dmin * a.y;
++        }
++    } else {
++        device const ushort * blk = (device const ushort *)(row + (k0 / 32 + h) * 18);
++        threadgroup uint * o = (threadgroup uint *)(wa + r * 64 + 32 * h);
++        inkling_iq4nl_unpack(blk + 1, o);
++        if (h == 0) { ws[r] = (float) as_type<half>(blk[0]); wm[r] = 0.0f; }
++    }
++}
++
++template<short TYPE, bool ID, short TM>
++kernel void kernel_inkling_w4a8g64(
++        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
++        device const char * input, device const uint * tiles, device const int * entries,
++        device float * output, device const char * qa, constant ggml_metal_kargs_inkling_a8 & a8,
++        threadgroup char * scratch [[threadgroup(0)]],
++        uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    (void) input;
++    uint expert = 0, first = 0, rows = TM;
++    if (ID) {
++        if (group.x >= tiles[0]) return;
++        expert = tiles[1 + group.x * 3];
++        first  = tiles[2 + group.x * 3];
++        rows   = min(tiles[3 + group.x * 3], (uint) TM);
++    } else {
++        first = group.x * TM;
++        rows  = min((uint) TM, (uint) args.ne1 - first);
++    }
++    const uint column = group.y * 64;
++    const int K = args.ne00, G = K / 64;
++
++    threadgroup int8_t * wa = (threadgroup int8_t *) scratch;
++    threadgroup int8_t * xb = wa + 64 * 64;
++    threadgroup float  * ws = (threadgroup float *)(xb + TM * 64);
++    threadgroup float  * wm = ws + 64;
++    threadgroup float  * xs = wm + 64;
++    threadgroup float  * xm = xs + TM;
++
++    auto ta = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(wa, dextents<int32_t, 2>(64, 64));
++    auto tb = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(xb, dextents<int32_t, 2>(64, TM));
++    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(TM, 64, 64, false, true, false,
++        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<4>> mm;
++    auto ci = mm.template get_destination_cooperative_tensor<decltype(tb), decltype(ta), int32_t>();
++
++    constexpr int CAP = TM * 64 / 128;
++    float acc[CAP];
++    short ri[CAP], ti[CAP];
++    FOR_UNROLL (short i = 0; i < CAP; ++i) {
++        acc[i] = 0.0f; ri[i] = 0; ti[i] = 0;
++        if (ci.is_valid_element(i)) { auto idx = ci.get_multidimensional_index(i); ri[i] = idx[0]; ti[i] = idx[1]; }
++    }
++
++    const short t = tid / 4, c = tid % 4;
++    int arow[TM / 32];
++    FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++        const uint tt = t + 32 * u;
++        arow[u] = -1;
++        if (tt < rows) {
++            if (ID) {
++                const int id = entries[first + tt];
++                arow[u] = (id / args.ne20) * args.ne11 + (id % args.ne20) % args.ne11;
++            } else {
++                arow[u] = first + tt;
++            }
++        }
++    }
++    device const char * wrow = weights + args.nb02 * expert + args.nb01 * (column + tid / 2);
++    device const float * asc = (device const float *)(qa + a8.off_s);
++    device const float * asm_ = (device const float *)(qa + a8.off_m);
++
++    for (int k0 = 0; k0 < K; k0 += 64) {
++        inkling_stage_w64<TYPE>(wrow, k0, tid / 2, tid % 2, wa, ws, wm);
++        FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++            const short tt = t + 32 * u;
++            uint4 v = 0;
++            if (arow[u] >= 0) v = *(device const uint4 *)(qa + (uint64_t) arow[u] * K + k0 + 16 * c);
++            *(threadgroup uint4 *)(xb + tt * 64 + 16 * c) = v;
++            if (c == 0) {
++                xs[tt] = arow[u] >= 0 ? asc [(uint64_t) arow[u] * G + k0 / 64] : 0.0f;
++                xm[tt] = arow[u] >= 0 ? asm_[(uint64_t) arow[u] * G + k0 / 64] : 0.0f;
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        mm.run(tb, ta, ci);
++        FOR_UNROLL (short i = 0; i < CAP; ++i) {
++            if (ci.is_valid_element(i)) {
++                const int r = ri[i], tt = ti[i];
++                acc[i] += ws[r] * xs[tt] * (float) ci[i] - wm[r] * xm[tt];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    threadgroup float * cst = (threadgroup float *) scratch;
++    FOR_UNROLL (short i = 0; i < CAP; ++i) {
++        if (ci.is_valid_element(i)) cst[ti[i] * 64 + ri[i]] = acc[i];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint job = tid; job < rows * 16; job += 128) {
++        const uint row = job / 16, offset = (job % 16) * 4;
++        device float * dest;
++        if (ID) {
++            const uint id = entries[first + row], lane = id % args.ne20, token = id / args.ne20;
++            dest = output + column + offset + (uint64_t(lane) + uint64_t(token) * args.ne1) * args.ne0;
++        } else {
++            dest = output + column + offset + uint64_t(first + row) * args.ne0;
++        }
++        *(device float4 *) dest = *(threadgroup float4 *)(cst + row * 64 + offset);
++    }
++}
++typedef decltype(kernel_inkling_w4a8g64<0, true, 32>) inkling_w4a8g64_fn;
++template [[host_name("kernel_inkling_w4a8g64_id_q4_K")]]     kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<0, true, 32>;
++template [[host_name("kernel_inkling_w4a8g64_id_iq4_nl")]]   kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<3, true, 32>;
++template [[host_name("kernel_inkling_w4a8g64_mm_q4_K")]]     kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<0, false, 32>;
++template [[host_name("kernel_inkling_w4a8g64_mm_iq4_nl")]]   kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<3, false, 32>;
++template [[host_name("kernel_inkling_w4a8g64t_id_q4_K")]]    kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<0, true, 64>;
++template [[host_name("kernel_inkling_w4a8g64t_id_iq4_nl")]]  kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<3, true, 64>;
++template [[host_name("kernel_inkling_w4a8g64t_mm_q4_K")]]    kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<0, false, 64>;
++template [[host_name("kernel_inkling_w4a8g64t_mm_iq4_nl")]]  kernel inkling_w4a8g64_fn kernel_inkling_w4a8g64<3, false, 64>;
++#endif
++
++#ifdef GGML_METAL_HAS_TENSOR
++template<short TYPE>
++static inline void inkling_load_w64(device const char * row, int k0, short h, thread uint * q, thread float & s, thread float & m) {
++    if (TYPE == 0) {
++        device const char * blk = row + (k0 / 256) * 144;
++        const short p = (k0 % 256) / 64;
++        device const uint * qs = (device const uint *)(blk + 16 + 32 * p + 16 * h);
++        FOR_UNROLL (short i = 0; i < 4; ++i) q[i] = qs[i];
++        const uchar2 a = get_scale_min_k4_just2(2 * p, 0, (device const uchar *)(blk + 4));
++        s = inkling_half(blk) * a.x;
++        m = inkling_half(blk + 2) * a.y;
++    } else {
++        device const ushort * blk = (device const ushort *)(row + (k0 / 32 + h) * 18);
++        FOR_UNROLL (short i = 0; i < 4; ++i) q[i] = uint(blk[1 + 2 * i]) | (uint(blk[2 + 2 * i]) << 16);
++        s = (float) as_type<half>(blk[0]);
++        m = 0.0f;
++    }
++}
++
++template<short TYPE>
++static inline void inkling_store_w64(short r, short h, thread const uint * q, float s, float m,
++        threadgroup int8_t * wa, threadgroup float * ws, threadgroup float * wm) {
++    if (TYPE == 0) {
++        threadgroup uint * lo = (threadgroup uint *)(wa + r * 64 + 16 * h);
++        threadgroup uint * hi = (threadgroup uint *)(wa + r * 64 + 32 + 16 * h);
++        FOR_UNROLL (short i = 0; i < 4; ++i) {
++            lo[i] = q[i] & 0x0F0F0F0Fu;
++            hi[i] = (q[i] >> 4) & 0x0F0F0F0Fu;
++        }
++        if (h == 0) { ws[r] = s; wm[r] = m; }
++    } else {
++        threadgroup uint * o = (threadgroup uint *)(wa + r * 64 + 32 * h);
++        FOR_UNROLL (short i = 0; i < 4; ++i) {
++            uint lo = 0, hi = 0;
++            FOR_UNROLL (short b = 0; b < 4; ++b) {
++                const uint byte = (q[i] >> (8 * b)) & 0xFFu;
++                lo |= uint(inkling_kv_iq4nl[byte & 0xFu]) << (8 * b);
++                hi |= uint(inkling_kv_iq4nl[byte >> 4])   << (8 * b);
++            }
++            o[i] = lo; o[4 + i] = hi;
++        }
++        if (h == 0) ws[r] = s;
++    }
++}
++
++template<short TYPE, bool ID, short TM>
++kernel void kernel_inkling_w4a8g64p(
++        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
++        device const char * input, device const uint * tiles, device const int * entries,
++        device float * output, device const char * qa, constant ggml_metal_kargs_inkling_a8 & a8,
++        threadgroup char * scratch [[threadgroup(0)]],
++        uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    (void) input;
++    uint expert = 0, first = 0, rows = TM;
++    if (ID) {
++        if (group.x >= tiles[0]) return;
++        expert = tiles[1 + group.x * 3];
++        first  = tiles[2 + group.x * 3];
++        rows   = min(tiles[3 + group.x * 3], (uint) TM);
++    } else {
++        first = group.x * TM;
++        rows  = min((uint) TM, (uint) args.ne1 - first);
++    }
++    const uint column = group.y * 64;
++    const int K = args.ne00, G = K / 64;
++
++    constexpr int BUF = 64 * 64 + TM * 64 + 64 * 4 * 2 + TM * 4 * 2;
++    threadgroup int8_t * wa[2];
++    threadgroup int8_t * xb[2];
++    threadgroup float  * ws[2];
++    threadgroup float  * wm[2];
++    threadgroup float  * xs[2];
++    threadgroup float  * xm[2];
++    FOR_UNROLL (short b = 0; b < 2; ++b) {
++        threadgroup char * base = scratch + b * BUF;
++        wa[b] = (threadgroup int8_t *) base;
++        xb[b] = wa[b] + 64 * 64;
++        ws[b] = (threadgroup float *)(xb[b] + TM * 64);
++        wm[b] = ws[b] + 64;
++        xs[b] = wm[b] + 64;
++        xm[b] = xs[b] + TM;
++    }
++
++    auto ta0 = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(wa[0], dextents<int32_t, 2>(64, 64));
++    auto tb0 = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(xb[0], dextents<int32_t, 2>(64, TM));
++    auto ta1 = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(wa[1], dextents<int32_t, 2>(64, 64));
++    auto tb1 = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(xb[1], dextents<int32_t, 2>(64, TM));
++    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(TM, 64, 64, false, true, false,
++        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<4>> mm;
++    auto ci = mm.template get_destination_cooperative_tensor<decltype(tb0), decltype(ta0), int32_t>();
++
++    constexpr int CAP = TM * 64 / 128;
++    float acc[CAP];
++    short ri[CAP], ti[CAP];
++    FOR_UNROLL (short i = 0; i < CAP; ++i) {
++        acc[i] = 0.0f; ri[i] = 0; ti[i] = 0;
++        if (ci.is_valid_element(i)) { auto idx = ci.get_multidimensional_index(i); ri[i] = idx[0]; ti[i] = idx[1]; }
++    }
++
++    const short t = tid / 4, c = tid % 4, r = tid / 2, h = tid % 2;
++    int arow[TM / 32];
++    FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++        const uint tt = t + 32 * u;
++        arow[u] = -1;
++        if (tt < rows) {
++            if (ID) {
++                const int id = entries[first + tt];
++                arow[u] = (id / args.ne20) * args.ne11 + (id % args.ne20) % args.ne11;
++            } else {
++                arow[u] = first + tt;
++            }
++        }
++    }
++    device const char * wrow = weights + args.nb02 * expert + args.nb01 * (column + r);
++    device const float * asc = (device const float *)(qa + a8.off_s);
++    device const float * asm_ = (device const float *)(qa + a8.off_m);
++
++    uint wq[4];
++    float wsv, wmv;
++    uint4 av[TM / 32];
++    float avs[TM / 32], avm[TM / 32];
++
++    auto load = [&](int k0) {
++        inkling_load_w64<TYPE>(wrow, k0, h, wq, wsv, wmv);
++        FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++            av[u] = 0; avs[u] = 0.0f; avm[u] = 0.0f;
++            if (arow[u] >= 0) {
++                av[u] = *(device const uint4 *)(qa + (uint64_t) arow[u] * K + k0 + 16 * c);
++                if (c == 0) {
++                    avs[u] = asc [(uint64_t) arow[u] * G + k0 / 64];
++                    avm[u] = asm_[(uint64_t) arow[u] * G + k0 / 64];
++                }
++            }
++        }
++    };
++    auto store = [&](short b) {
++        inkling_store_w64<TYPE>(r, h, wq, wsv, wmv, wa[b], ws[b], wm[b]);
++        FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++            const short tt = t + 32 * u;
++            *(threadgroup uint4 *)(xb[b] + tt * 64 + 16 * c) = av[u];
++            if (c == 0) { xs[b][tt] = avs[u]; xm[b][tt] = avm[u]; }
++        }
++    };
++
++    load(0);
++    store(0);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int g = 0; g < G; ++g) {
++        const short cur = g & 1;
++        const bool more = g + 1 < G;
++        if (more) load((g + 1) * 64);
++        if (cur) mm.run(tb1, ta1, ci); else mm.run(tb0, ta0, ci);
++        threadgroup const float * cws = ws[cur];
++        threadgroup const float * cxs = xs[cur];
++        if (TYPE == 0) {
++            threadgroup const float * cwm = wm[cur];
++            threadgroup const float * cxm = xm[cur];
++            FOR_UNROLL (short i = 0; i < CAP; ++i) {
++                if (ci.is_valid_element(i)) acc[i] += cws[ri[i]] * cxs[ti[i]] * (float) ci[i] - cwm[ri[i]] * cxm[ti[i]];
++            }
++        } else {
++            FOR_UNROLL (short i = 0; i < CAP; ++i) {
++                if (ci.is_valid_element(i)) acc[i] += cws[ri[i]] * cxs[ti[i]] * (float) ci[i];
++            }
++        }
++        if (more) store(cur ^ 1);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    threadgroup float * cst = (threadgroup float *) scratch;
++    FOR_UNROLL (short i = 0; i < CAP; ++i) {
++        if (ci.is_valid_element(i)) cst[ti[i] * 64 + ri[i]] = acc[i];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint job = tid; job < rows * 16; job += 128) {
++        const uint row = job / 16, offset = (job % 16) * 4;
++        device float * dest;
++        if (ID) {
++            const uint id = entries[first + row], lane = id % args.ne20, token = id / args.ne20;
++            dest = output + column + offset + (uint64_t(lane) + uint64_t(token) * args.ne1) * args.ne0;
++        } else {
++            dest = output + column + offset + uint64_t(first + row) * args.ne0;
++        }
++        *(device float4 *) dest = *(threadgroup float4 *)(cst + row * 64 + offset);
++    }
++}
++typedef decltype(kernel_inkling_w4a8g64p<0, true, 32>) inkling_w4a8g64p_fn;
++template [[host_name("kernel_inkling_w4a8g64p_id_q4_K")]]    kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<0, true, 32>;
++template [[host_name("kernel_inkling_w4a8g64p_id_iq4_nl")]]  kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<3, true, 32>;
++template [[host_name("kernel_inkling_w4a8g64p_mm_q4_K")]]    kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<0, false, 32>;
++template [[host_name("kernel_inkling_w4a8g64p_mm_iq4_nl")]]  kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<3, false, 32>;
++template [[host_name("kernel_inkling_w4a8g64pt_id_q4_K")]]   kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<0, true, 64>;
++template [[host_name("kernel_inkling_w4a8g64pt_id_iq4_nl")]] kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<3, true, 64>;
++template [[host_name("kernel_inkling_w4a8g64pt_mm_q4_K")]]   kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<0, false, 64>;
++template [[host_name("kernel_inkling_w4a8g64pt_mm_iq4_nl")]] kernel inkling_w4a8g64p_fn kernel_inkling_w4a8g64p<3, false, 64>;
++#endif
++
++#ifdef GGML_METAL_HAS_TENSOR
++template<short TYPE, bool ID, short TM>
++static inline void inkling_g64_body(
++        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
++        device const char * input, device const uint * tiles, device const int * entries,
++        device float * output, device const char * qa, constant ggml_metal_kargs_inkling_a8 & a8,
++        threadgroup char * scratch,
++        uint2 group, ushort tid) {
++    (void) input;
++    uint expert = 0, first = 0, rows = TM;
++    if (ID) {
++        if (group.x >= tiles[0]) return;
++        expert = tiles[1 + group.x * 3];
++        first  = tiles[2 + group.x * 3];
++        rows   = min(tiles[3 + group.x * 3], (uint) TM);
++    } else {
++        first = group.x * TM;
++        rows  = min((uint) TM, (uint) args.ne1 - first);
++    }
++    const uint column = group.y * 64;
++    const int K = args.ne00, G = K / 64;
++
++    threadgroup int8_t * wa = (threadgroup int8_t *) scratch;
++    threadgroup int8_t * xb = wa + 64 * 64;
++    threadgroup float  * ws = (threadgroup float *)(xb + TM * 64);
++    threadgroup float  * wm = ws + 64;
++    threadgroup float  * xs = wm + 64;
++    threadgroup float  * xm = xs + TM;
++
++    auto ta = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(wa, dextents<int32_t, 2>(64, 64));
++    auto tb = tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline>(xb, dextents<int32_t, 2>(64, TM));
++    mpp::tensor_ops::matmul2d<mpp::tensor_ops::matmul2d_descriptor(TM, 64, 64, false, true, false,
++        mpp::tensor_ops::matmul2d_descriptor::mode::multiply), execution_simdgroups<4>> mm;
++    auto ci = mm.template get_destination_cooperative_tensor<decltype(tb), decltype(ta), int32_t>();
++
++    constexpr int CAP = TM * 64 / 128;
++    float acc[CAP];
++    short ri[CAP], ti[CAP];
++    FOR_UNROLL (short i = 0; i < CAP; ++i) {
++        acc[i] = 0.0f; ri[i] = 0; ti[i] = 0;
++        if (ci.is_valid_element(i)) { auto idx = ci.get_multidimensional_index(i); ri[i] = idx[0]; ti[i] = idx[1]; }
++    }
++
++    const short t = tid / 4, c = tid % 4;
++    int arow[TM / 32];
++    FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++        const uint tt = t + 32 * u;
++        arow[u] = -1;
++        if (tt < rows) {
++            if (ID) {
++                const int id = entries[first + tt];
++                arow[u] = (id / args.ne20) * args.ne11 + (id % args.ne20) % args.ne11;
++            } else {
++                arow[u] = first + tt;
++            }
++        }
++    }
++    device const char * wrow = weights + args.nb02 * expert + args.nb01 * (column + tid / 2);
++    device const float * asc = (device const float *)(qa + a8.off_s);
++    device const float * asm_ = (device const float *)(qa + a8.off_m);
++
++    for (int k0 = 0; k0 < K; k0 += 64) {
++        inkling_stage_w64<TYPE>(wrow, k0, tid / 2, tid % 2, wa, ws, wm);
++        FOR_UNROLL (short u = 0; u < TM / 32; ++u) {
++            const short tt = t + 32 * u;
++            uint4 v = 0;
++            if (arow[u] >= 0) v = *(device const uint4 *)(qa + (uint64_t) arow[u] * K + k0 + 16 * c);
++            *(threadgroup uint4 *)(xb + tt * 64 + 16 * c) = v;
++            if (c == 0) {
++                xs[tt] = arow[u] >= 0 ? asc [(uint64_t) arow[u] * G + k0 / 64] : 0.0f;
++                xm[tt] = arow[u] >= 0 ? asm_[(uint64_t) arow[u] * G + k0 / 64] : 0.0f;
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        mm.run(tb, ta, ci);
++        FOR_UNROLL (short i = 0; i < CAP; ++i) {
++            if (ci.is_valid_element(i)) {
++                const int r = ri[i], tt = ti[i];
++                acc[i] += ws[r] * xs[tt] * (float) ci[i] - wm[r] * xm[tt];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    threadgroup float * cst = (threadgroup float *) scratch;
++    FOR_UNROLL (short i = 0; i < CAP; ++i) {
++        if (ci.is_valid_element(i)) cst[ti[i] * 64 + ri[i]] = acc[i];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint job = tid; job < rows * 16; job += 128) {
++        const uint row = job / 16, offset = (job % 16) * 4;
++        device float * dest;
++        if (ID) {
++            const uint id = entries[first + row], lane = id % args.ne20, token = id / args.ne20;
++            dest = output + column + offset + (uint64_t(lane) + uint64_t(token) * args.ne1) * args.ne0;
++        } else {
++            dest = output + column + offset + uint64_t(first + row) * args.ne0;
++        }
++        *(device float4 *) dest = *(threadgroup float4 *)(cst + row * 64 + offset);
++    }
++}
++
++template<short TYPE>
++kernel void kernel_inkling_w4a8g64a(
++        constant ggml_metal_kargs_mul_mm_id & args, device const char * weights,
++        device const char * input, device const uint * tiles, device const int * entries,
++        device float * output, device const char * qa, constant ggml_metal_kargs_inkling_a8 & a8,
++        threadgroup char * scratch [[threadgroup(0)]],
++        uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    if (group.x >= tiles[0]) return;
++    if (tiles[3 + group.x * 3] <= 32) inkling_g64_body<TYPE, true, 32>(args, weights, input, tiles, entries, output, qa, a8, scratch, group, tid);
++    else                              inkling_g64_body<TYPE, true, 64>(args, weights, input, tiles, entries, output, qa, a8, scratch, group, tid);
++}
++typedef decltype(kernel_inkling_w4a8g64a<0>) inkling_w4a8g64a_fn;
++template [[host_name("kernel_inkling_w4a8g64a_id_q4_K")]]   kernel inkling_w4a8g64a_fn kernel_inkling_w4a8g64a<0>;
++template [[host_name("kernel_inkling_w4a8g64a_id_iq4_nl")]] kernel inkling_w4a8g64a_fn kernel_inkling_w4a8g64a<3>;
++#endif
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
 @@ -1,6 +1,12 @@
 +#include "ggml-inkling.h"
 +#include <cstdlib>
@@ -1847,11 +2436,10 @@
      // swa tensors may not be allocated if there are no SWA attention layers
      if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
          attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
-@@ -2323,6 +2340,28 @@
+@@ -2323,6 +2340,27 @@
      return cur;
  }
  
-+// CPU fallback for the optional fused Inkling routed activation.
 +static void inkling_situ_cpu(ggml_tensor * dst, int ith, int nth, void *) {
 +    float beta, limit;
 +    memcpy(&beta, dst->op_params + GGML_INKLING_TAG_SLOT - 2, sizeof(float));
@@ -1876,7 +2464,7 @@
  ggml_tensor * llm_graph_context::build_moe_ffn(
           ggml_tensor * cur,
           ggml_tensor * gate_inp,
-@@ -2671,6 +2710,17 @@
+@@ -2671,6 +2709,17 @@
                      const float beta = hparams.situ_beta;
                      const float lb   = hparams.situ_linear_beta;
  
@@ -1894,7 +2482,7 @@
                      ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                      act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                      if (lb > 0.0f) {
-@@ -3227,6 +3277,10 @@
+@@ -3227,6 +3276,10 @@
          res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
  
          ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -1905,7 +2493,7 @@
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
          ggml_prec_set_acc(cur, GGML_PREC_F32);
-@@ -4472,9 +4526,58 @@
+@@ -4472,9 +4525,55 @@
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  
@@ -1921,9 +2509,6 @@
      return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
  }
  
-+// Gather learned relative biases directly into the per-head flash-attention mask.
-+// The original path gathers F32 vectors, transposes them, adds the causal mask
-+// and casts to half. Here each score is written only once.
 +static void inkling_relative_mask_cpu(ggml_tensor * dst, int ith, int nth, void *) {
 +    const auto * table = (const float *) dst->src[0]->data;
 +    const auto * ids = (const int32_t *) dst->src[1]->data;
@@ -1964,11 +2549,10 @@
  ggml_tensor * llm_graph_context::build_attn(
          llm_graph_input_mem_hybrid_iswa_rel * inp,
          ggml_tensor * wo,
-@@ -4499,6 +4602,59 @@
+@@ -4499,6 +4598,56 @@
  
      // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
      ggml_tensor * kq_mask = attn_mask.raw;
-+    // INKLING_REL_FA: keep the shared causal mask and gather the bias by distance inside flash attention
 +    if (!is_swa && inp->self_qpos && model.arch == LLM_ARCH_INKLING2_LOOP && cparams.flash_attn &&
 +        kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[3] == 1 && kq_mask->ne[2] == 1 &&
 +        kq_b->op == GGML_OP_CONT && kq_b->src[0]->op == GGML_OP_PERMUTE &&
@@ -1976,7 +2560,7 @@
 +        auto * gathered = kq_b->src[0]->src[0]->src[0];
 +        if (gathered->op == GGML_OP_GET_ROWS && gathered->src[0]->op == GGML_OP_CONT &&
 +            gathered->src[0]->src[0]->op == GGML_OP_PERMUTE) {
-+            auto * table = gathered->src[0]->src[0]->src[0]; // F32 [extent + 1, n_head, n_tokens]
++            auto * table = gathered->src[0]->src[0]->src[0];
 +            if (table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[0] == (int64_t) inp->extent + 1) {
 +                g_inkling_rel_pending = { table, inp->self_qpos, inp->self_kpos };
 +                auto * out = build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
@@ -1990,13 +2574,11 @@
 +        cparams.flash_attn && kq_mask->type == GGML_TYPE_F16 && kq_mask->ne[3] == 1 &&
 +        kq_b->op == GGML_OP_CONT && kq_b->src[0]->op == GGML_OP_PERMUTE &&
 +        kq_b->src[0]->src[0]->op == GGML_OP_RESHAPE) {
-+        // Recognize the two layout permutations in inkling2::graph::build_layer.
 +        auto * gathered = kq_b->src[0]->src[0]->src[0];
 +        if (gathered->op == GGML_OP_GET_ROWS && gathered->src[0]->op == GGML_OP_CONT &&
 +            gathered->src[0]->src[0]->op == GGML_OP_PERMUTE) {
 +            auto * table = gathered->src[0]->src[0]->src[0];
 +            auto * ids = gathered->src[1];
-+            // INKLING_REL_BIAS: table = mul_mat(pad(bias), r) - sinks, computed per score inside the mask
 +            if (std::getenv("INKLING_REL_BIAS") && table->op == GGML_OP_SUB && table->src[0]->op == GGML_OP_MUL_MAT &&
 +                table->src[0]->src[0]->op == GGML_OP_PAD && table->src[1]->ne[0] == 1) {
 +                auto * mm = table->src[0];
@@ -2024,26 +2606,24 @@
      if (kq_mask->type != GGML_TYPE_F32) {
          kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
      }
---- a/src/llama-graph.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/llama-graph.h	2026-11-22 17:39:06.000000000 +0800
-@@ -807,6 +807,10 @@
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -807,6 +807,9 @@
      ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
      ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
  
-+    // INKLING_REL_FA: positions for the bias gathered inside flash attention (non-SWA layers)
-+    ggml_tensor * self_qpos = nullptr; // I32 [n_batch]
-+    ggml_tensor * self_kpos = nullptr; // I32 [n_kv]
++    ggml_tensor * self_qpos = nullptr;
++    ggml_tensor * self_kpos = nullptr;
 +
      const uint32_t extent;
      const uint32_t extent_swa;
  
---- a/src/llama-kv-cache.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/llama-kv-cache.cpp	2026-11-22 17:39:06.000000000 +0800
-@@ -2021,6 +2021,18 @@
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2021,6 +2021,17 @@
      ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
  }
  
-+// position of each cell of the K/V view; empty cells get a position after every query, so their distance is negative
 +void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
 +    GGML_ASSERT(dst->type == GGML_TYPE_I32);
 +    const int64_t n_kv = dst->ne[0];
@@ -2058,7 +2638,7 @@
  void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
      const uint32_t n_tokens = ubatch.n_tokens;
  
-@@ -3128,6 +3140,10 @@
+@@ -3128,6 +3139,10 @@
      kv->set_input_relative_pos(dst, ubatch, extent);
  }
  
@@ -2069,8 +2649,8 @@
  void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
      kv->get_prev_tokens(ubatch, n, res);
  }
---- a/src/llama-kv-cache.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/llama-kv-cache.h	2026-11-22 17:39:06.000000000 +0800
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
 @@ -250,6 +250,7 @@
      void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -2087,23 +2667,21 @@
  
      // see llama_kv_cache::get_prev_tokens()
      void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
---- a/src/llama-model.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/llama-model.cpp	2026-11-22 14:14:22.000000000 +0800
-@@ -2047,7 +2047,11 @@
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2047,7 +2047,9 @@
      // per-tensor activation precision policy
      prec_policy.load(ml, *this);
  
 -    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
-+    // CPU-routed experts can be faulted in as needed on memory-constrained Macs.
-+    // Keep normal readahead for every other model and for explicitly locked weights.
 +    const bool demand_page = arch == LLM_ARCH_INKLING2_LOOP && !use_mlock &&
 +        std::getenv("INKLING_DEMAND_PAGE") != nullptr;
 +    ml.init_mappings(!demand_page, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
---- a/src/models/inkling2.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/models/inkling2.cpp	2026-11-23 03:01:49.000000000 +0800
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
 @@ -1,4 +1,8 @@
  #include "models.h"
 +#include "ggml-inkling.h"
@@ -2150,11 +2728,10 @@
      ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
      norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
  
-@@ -174,15 +202,87 @@
+@@ -174,15 +202,82 @@
      return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
  }
  
-+// CPU fallback for the optional fused depth-attention graph.
 +static void inkling_depth_mix_cpu(ggml_tensor * dst, int ith, int nth, void *) {
 +    const int width = dst->ne[0], tokens = dst->ne[1], queries = dst->ne[2];
 +    const int count = dst->op_params[GGML_INKLING_COUNT_SLOT];
@@ -2200,10 +2777,8 @@
 +    if (std::getenv("INKLING_DEPTH_MIX") && n_states <= GGML_INKLING_DEPTH_MAX && n_embd % 4 == 0 &&
 +        supported(query) && supported(cur) && std::all_of(blocks.begin(), blocks.end(), supported)) {
 +        ggml_tensor * args[1 + GGML_INKLING_DEPTH_MAX] = { query };
-+        // The original concat loop prepends earlier blocks, ending with cur.
 +        std::reverse_copy(blocks.begin(), blocks.end(), args + 1);
 +        args[n_states] = cur;
-+        // stored query-major [n_embd, n_tokens, queries] so each query's slice is contiguous
 +        auto * out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, query->ne[1], 1, args,
 +                                   n_states + 1, inkling_depth_mix_cpu, GGML_N_TASKS_MAX, nullptr);
 +        out->op_params[GGML_INKLING_COUNT_SLOT] = n_states;
@@ -2217,8 +2792,6 @@
 +    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 +    ggml_tensor * queries;
 +    if (std::getenv("INKLING_DEPTH_CACHE")) {
-+        // RMS is per hidden vector. Each completed block is reused by many
-+        // subsequent layers in this graph. Store each normalized prefix once.
 +        states = ggml_rms_norm(ctx0, states, 1e-6f);
 +        ggml_tensor * bank = nullptr;
 +        std::vector<ggml_tensor *> key;
@@ -2243,7 +2816,7 @@
  
      ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
      scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
-@@ -190,6 +290,43 @@
+@@ -190,6 +285,67 @@
      return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
  }
  
@@ -2268,6 +2841,30 @@
 +    }
 +}
 +
++static void inkling_shortconv_prefill_cpu(ggml_tensor * dst, int ith, int nth, void *) {
++    const auto * past = (const float *) dst->src[0]->data, * w = (const float *) dst->src[1]->data, * cur = (const float *) dst->src[2]->data;
++    auto * cell = (float *) dst->src[3]->data;
++    const auto * taps = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
++    const int64_t channels = dst->ne[0], seq = dst->ne[1], heads = taps ? dst->src[4]->ne[0] / 4 : 0;
++    const float scale = 1.0f / sqrtf(taps ? 9.0f : 5.0f);
++    for (int64_t id = ith; id < channels * seq; id += nth) {
++        const int64_t t = id / channels, c = id % channels;
++        float x[4];
++        for (int k = 0; k < 4; ++k) {
++            const int64_t p = t + k;
++            x[k] = p < 3 ? past[3 * c + p] : cur[(p - 3) * channels + c];
++        }
++        float value = 0;
++        for (int k = 0; k < 4; ++k) value += x[k] * w[c * 4 + k];
++        if (taps) {
++            auto * coefficients = taps + 4 * (t * heads + c / (channels / heads));
++            for (int k = 0; k < 4; ++k) value += x[3 - k] * coefficients[k];
++        }
++        ((float *) dst->data)[id] = (cur[id] + value) * scale;
++        if (t + 3 >= seq) cell[3 * c + (t + 3 - seq)] = x[3];
++    }
++}
++
 +static void inkling_shortconv_step_cpu(ggml_tensor * dst, int ith, int nth, void *) {
 +    const auto * past = (const float *) dst->src[0]->data, * w = (const float *) dst->src[1]->data, * cur = (const float *) dst->src[2]->data;
 +    auto * cell = (float *) dst->src[3]->data;
@@ -2287,7 +2884,7 @@
  // causal short convolution with a residual; dynamic adds input-dependent taps per head
  // the last n_conv - 1 inputs of each sequence live in the recurrent state at channel offset `offset`
  ggml_tensor * llama_model_inkling2::graph::convolve(
-@@ -207,11 +344,31 @@
+@@ -207,11 +363,42 @@
  
      ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
  
@@ -2300,6 +2897,17 @@
 +                                    inkling_shortconv_step_cpu, 1, nullptr);
 +        out->op_params[GGML_INKLING_TAG_SLOT] = GGML_INKLING_CONV1_TAG;
 +        if (ggml_is_inkling_conv_step(out)) return out;
++    }
++
++    if (std::getenv("INKLING_CONV_FUSE") && n_seq_tokens >= 3 && n_seqs == 1 && n_conv == 4 && cparams.n_rs_seq == 0 &&
++        state->type == GGML_TYPE_F32 && ggml_is_contiguous(past)) {
++        const size_t cell_offs = inp->mctx->get_head()*state->nb[1] + offset*(n_conv - 1)*ggml_element_size(state);
++        ggml_tensor * cell = ggml_view_1d(ctx0, state, (n_conv - 1)*n_channels, cell_offs);
++        ggml_tensor * args[] = { past, weight, cur, cell, dynamic };
++        auto * out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_channels, n_seq_tokens, 1, 1, args, dynamic ? 5 : 4,
++                                    inkling_shortconv_prefill_cpu, 1, nullptr);
++        out->op_params[GGML_INKLING_TAG_SLOT] = GGML_INKLING_CONVP_TAG;
++        if (ggml_is_inkling_conv_prefill(out)) return out;
 +    }
 +
      ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -2319,7 +2927,7 @@
      ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
      out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
  
-@@ -237,12 +394,112 @@
+@@ -237,12 +424,109 @@
  }
  
  // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
@@ -2383,9 +2991,6 @@
 -    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
 +    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl], gate);
 +    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
-+    // The original mapped GGUF places each forget matrix immediately before its gain
-+    // matrix. The two projections read the same activation. Represent these existing
-+    // rows as one matrix when their actual runtime storage and precision policy agree.
 +    if (std::getenv("INKLING_PAIRED_GATES") && ggml_get_no_alloc(ctx0) &&
 +        gain->op == GGML_OP_MUL_MAT && forget->op == GGML_OP_MUL_MAT &&
 +        gain->src[1] == gate && forget->src[1] == gate &&
@@ -2434,7 +3039,7 @@
  
      return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
  }
-@@ -275,6 +532,7 @@
+@@ -275,6 +559,7 @@
      GGML_ASSERT(!messages == !loop);
  
      const auto & layer = model.layers[il];
@@ -2442,7 +3047,7 @@
  
      const bool    is_swa       = hparams.is_swa(il);
      const int64_t n_head       = hparams.n_head(il);
-@@ -284,7 +542,8 @@
+@@ -284,7 +569,8 @@
  
      // the message of controller ctrl, [n_embd, n_tokens]
      auto message = [&](int ctrl) {
@@ -2452,7 +3057,7 @@
      };
  
      ggml_tensor * state   = recr->mctx->get_r_l(il);
-@@ -298,15 +557,28 @@
+@@ -298,15 +584,28 @@
      if (layer.attn_res_query) {
          ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
          for (int j = 0; j < 3; ++j) {
@@ -2482,7 +3087,7 @@
      }
  
      if (is_swa && messages) {
-@@ -324,12 +596,24 @@
+@@ -324,12 +623,23 @@
  
      // self-attention
      {
@@ -2492,7 +3097,6 @@
 -        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
 -                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
 +        if (order) for (int j = 0; j < 3; ++j) ggml_build_forward_expand(gf, inputs[j]);
-+        // every projection of the normalized inputs first, so independent matmuls are adjacent in the graph
 +        ggml_tensor * Qproj = build_lora_mm(layer.wq, inputs[0]);
 +        ggml_tensor * Kproj = build_lora_mm(layer.wk, inputs[1]);
 +        ggml_tensor * Vproj = build_lora_mm(layer.wv, inputs[2]);
@@ -2512,7 +3116,7 @@
  
          Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
          Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
-@@ -351,7 +635,6 @@
+@@ -351,7 +661,6 @@
          const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
          const int64_t n_kv     = rel_pos->ne[0];
  
@@ -2520,7 +3124,7 @@
  
          // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
          ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-@@ -371,7 +654,7 @@
+@@ -371,7 +680,7 @@
                  nullptr, nullptr, nullptr,
                  Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
  
@@ -2529,8 +3133,8 @@
          cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
          cb(cur, "attn_out", il);
      }
---- a/src/models/models.h	2026-11-22 00:24:19.000000000 +0800
-+++ b/src/models/models.h	2026-11-23 03:01:49.000000000 +0800
+--- a/src/models/models.h
++++ b/src/models/models.h
 @@ -2527,6 +2527,7 @@
  
      struct graph : public llm_graph_context {
@@ -2547,8 +3151,8 @@
  
      protected:
          // the helpers alone, a derived graph builds its own body
---- a/tools/server/server-context.cpp	2026-11-22 00:24:19.000000000 +0800
-+++ b/tools/server/server-context.cpp	2026-11-22 14:14:22.000000000 +0800
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
 @@ -4334,6 +4334,11 @@
                      }
  
@@ -2561,12 +3165,10 @@
  
                      // make checkpoints only for completion tasks
                      do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
-@@ -4447,6 +4452,13 @@
+@@ -4447,6 +4452,11 @@
                          }
                          slot.prompt.tokens.push_back(cur_tok);
  
-+                        // A fixed decomposition gives a replayed suffix the same matrix shapes
-+                        // as its cold evaluation. Split points depend only on absolute position.
 +                        if (grid_checkpoint) {
 +                            if (slot.prompt.n_tokens() % grid == 0) break;
 +                            continue;
@@ -2575,20 +3177,18 @@
                          // break at the last user message, or at user messages at least min step past the last checkpoint
                          if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                              const auto pos = slot.prompt.n_tokens();
-@@ -4463,7 +4475,11 @@
+@@ -4463,7 +4473,9 @@
                          //  - 4
                          // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                          if (do_checkpoint) {
 -                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-+                            // A second question about the same document commonly changes more
-+                            // than the final four tokens. Preserve one state near the question.
 +                            static const bool reuse_document = std::getenv("INKLING_DOCUMENT_CHECKPOINT") != nullptr;
 +                            const int tail = reuse_document && slot.task->n_tokens() > n_ubatch ? 64 : 4;
 +                            const int checkpoint_offsets[] = {4 + n_ubatch, tail, 4};
  
                              bool should_break = false;
                              for (int offset : checkpoint_offsets) {
-@@ -4526,6 +4542,7 @@
+@@ -4526,6 +4538,7 @@
  
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
@@ -2596,14 +3196,12 @@
  
                      // no need to create checkpoints that are too close together, unless it's the last user message
                      do_checkpoint = do_checkpoint && (
---- /dev/null	2026-11-03 20:17:22.535146041 +0800
-+++ b/ggml/include/ggml-inkling.h	2026-11-23 01:30:45.000000000 +0800
-@@ -0,0 +1,159 @@
+--- a/ggml/include/ggml-inkling.h
++++ b/ggml/include/ggml-inkling.h
+@@ -0,0 +1,164 @@
 +#pragma once
 +#include "ggml.h"
 +
-+// Reserved trailing words of the custom op's parameters. The CPU callback and
-+// its data occupy the leading words. Other custom operations remain unchanged.
 +#define GGML_INKLING_TAG_SLOT (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1)
 +#define GGML_INKLING_COUNT_SLOT (GGML_INKLING_TAG_SLOT - 1)
 +#define GGML_INKLING_DEPTH_TAG 0x49444d58
@@ -2693,8 +3291,6 @@
 +        ggml_is_contiguous(op) && ggml_are_same_shape(op, op->src[2]);
 +}
 +
-+// Relative bias computed in the mask: srcs { bias [R, E], r [R, H, T], sinks [1, H, T], ids [K, T], causal [K, T] }.
-+// out[k, q, h] = (ids < E ? dot(r[:, h, q], bias[:, ids]) : 0) - sinks[h, q] + causal[k, q], in F16.
 +#define GGML_INKLING_RELB_TAG 0x4952424d
 +static inline bool ggml_is_inkling_relative_bias_mask(const struct ggml_tensor * op) {
 +    if (op->op != GGML_OP_CUSTOM || op->op_params[GGML_INKLING_TAG_SLOT] != GGML_INKLING_RELB_TAG) return false;
@@ -2708,11 +3304,6 @@
 +        ggml_are_same_shape(ids, mask);
 +}
 +
-+// Fused single-token loop controller (decode).
-+//   down:  srcs { cur [H, 1], msg [H, 1], W [2H, R] }           out z [R, 1] = W . concat(rms(cur), rms(msg))
-+//   merge: srcs { cur [H, 1], msg [H, 1], z [64, 1], Wg [64, H], Wf [64, H] }
-+//          out [H, 1] = (cur - tanh(Wf . z) * cur) + tanh(Wg . z) * msg
-+// Weights are F32 or F16, rms uses eps 1e-6.
 +#define GGML_INKLING_CDOWN_TAG 0x4943444e
 +#define GGML_INKLING_CMERGE_TAG 0x49434d47
 +static inline bool ggml_inkling_ctrl_vec(const struct ggml_tensor * t, int64_t n) {
@@ -2741,8 +3332,22 @@
 +        ggml_inkling_ctrl_merge_inputs(op->src) && ggml_inkling_ctrl_vec(op, op->src[0]->ne[0]);
 +}
 +
-+// Single-token short convolution that also advances the recurrent state in place.
-+// srcs { past [3*C] (gathered copy of the state), w [4, C], cur [C], cell [3*C] (state slot, written), taps [4*heads]? }
++#define GGML_INKLING_CONVP_TAG 0x49435650
++static inline bool ggml_is_inkling_conv_prefill(const struct ggml_tensor * op) {
++    if (op->op != GGML_OP_CUSTOM || op->op_params[GGML_INKLING_TAG_SLOT] != GGML_INKLING_CONVP_TAG) return false;
++    const struct ggml_tensor * past = op->src[0], * w = op->src[1], * cur = op->src[2], * cell = op->src[3], * taps = op->src[4];
++    if (!past || !w || !cur || !cell || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) return false;
++    const int64_t c = cur->ne[0], t = cur->ne[1];
++    if (!ggml_is_matrix(cur) || t < 3 || !ggml_are_same_shape(op, cur) || ggml_nelements(past) != 3 * c ||
++        ggml_nelements(cell) != 3 * c || w->ne[0] != 4 || w->ne[1] != c) return false;
++    const struct ggml_tensor * dense[4] = { past, w, cur, cell };
++    for (int i = 0; i < 4; ++i) {
++        if (dense[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(dense[i])) return false;
++    }
++    return !taps || (taps->type == GGML_TYPE_F32 && ggml_is_matrix(taps) && ggml_is_contiguous(taps) &&
++        taps->ne[1] == t && taps->ne[0] > 0 && taps->ne[0] % 4 == 0 && c % (taps->ne[0] / 4) == 0);
++}
++
 +#define GGML_INKLING_CONV1_TAG 0x49435631
 +static inline bool ggml_is_inkling_conv_step(const struct ggml_tensor * op) {
 +    if (op->op != GGML_OP_CUSTOM || op->op_params[GGML_INKLING_TAG_SLOT] != GGML_INKLING_CONV1_TAG) return false;
